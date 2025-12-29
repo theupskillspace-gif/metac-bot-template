@@ -27,10 +27,10 @@ from forecasting_tools import (
 )
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("UpskillBot")  # ✅ Updated logger name
 
 
-class TavilyResearchBot2025(ForecastBot):
+class UpskillBot(ForecastBot):  # ✅ Renamed class
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
@@ -54,7 +54,7 @@ class TavilyResearchBot2025(ForecastBot):
         async with self._tavily_lock:
             if self._tavily_query_count >= self._max_tavily_queries:
                 raise RuntimeError(
-                    f"Tavily query limit reached ({self._max_tavily_queries}). "
+                    f"UpskillBot: Tavily query limit reached ({self._max_tavily_queries}). "
                     "Stopping further research to avoid overage."
                 )
             self._tavily_query_count += 1
@@ -113,7 +113,7 @@ class TavilyResearchBot2025(ForecastBot):
 
                 return clean_indents(
                     f"""
-                    ### Tavily Research (as of {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})
+                    ### UpskillBot Real-Time Research (as of {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})
                     **AI Summary**: {answer}
 
                     **Top Sources**:
@@ -124,7 +124,7 @@ class TavilyResearchBot2025(ForecastBot):
                 )
 
             except Exception as e:
-                logger.error(f"Tavily failed for {question.id}: {e}")
+                logger.error(f"UpskillBot: Research failed for Q{question.id}: {e}")
                 return f"⚠️ Research unavailable ({e}). Use caution."
 
     # ===== FORECAST HELPERS =====
@@ -187,7 +187,7 @@ class TavilyResearchBot2025(ForecastBot):
             )
             prob = max(0.01, min(0.99, pred.prediction_in_decimal))
         except Exception as e:
-            logger.warning(f"Binary parse fail {question.id}: {e}")
+            logger.warning(f"UpskillBot: Binary parse fail for Q{question.id}: {e}")
             prob = 0.5
 
         # Store for Brier & CSV
@@ -204,7 +204,7 @@ class TavilyResearchBot2025(ForecastBot):
         )
         return clean_indents(
             f"""
-            You are a calibration-aware superforecaster. Use only real evidence.
+            You are a calibration-aware superforecaster for UpskillBot. Use only real evidence.
 
             Question: {question.question_text}
             Resolution: {question.resolution_criteria}
@@ -243,7 +243,7 @@ class TavilyResearchBot2025(ForecastBot):
                 additional_instructions=f"Options: {question.options}",
             )
         except Exception as e:
-            logger.warning(f"MC parse fail {question.id}: {e}")
+            logger.warning(f"UpskillBot: MC parse fail for Q{question.id}: {e}")
             n = len(question.options)
             pred_list = PredictedOptionList(
                 probabilities={opt: round(100.0 / n, 1) for opt in question.options}
@@ -259,7 +259,7 @@ class TavilyResearchBot2025(ForecastBot):
     def _build_mc_prompt(self, question: MultipleChoiceQuestion, research: str) -> str:
         return clean_indents(
             f"""
-            Superforecaster mode. Ground in research.
+            UpskillBot superforecaster mode. Ground in research.
 
             Question: {question.question_text}
             Options: {question.options}
@@ -296,11 +296,11 @@ class TavilyResearchBot2025(ForecastBot):
 
             # 🔁 Double-median for stock questions
             if self._is_stock_question(question):
-                logger.info(f"Applying double-median adjustment (stock question) to {question.id}")
+                logger.info(f"UpskillBot: Applying double-median adjustment (stock question) to Q{question.id}")
                 dist = self._apply_double_median_to_numeric(dist)
 
         except Exception as e:
-            logger.warning(f"Numeric parse fail {question.id}: {e}")
+            logger.warning(f"UpskillBot: Numeric parse fail for Q{question.id}: {e}")
             lo, hi = question.lower_bound, question.upper_bound
             fallback = [
                 Percentile(p, lo + (hi - lo) * p / 100)
@@ -324,7 +324,7 @@ class TavilyResearchBot2025(ForecastBot):
         )
         return clean_indents(
             f"""
-            Calibrated numeric forecaster. Cite numbers from research.
+            UpskillBot calibrated numeric forecaster. Cite numbers from research.
 
             Question: {question.question_text}
             Units: {question.unit_of_measure or 'Infer'}
@@ -428,7 +428,7 @@ class TavilyResearchBot2025(ForecastBot):
 
             if scored > 0:
                 avg_brier = brier_sum / scored
-                logger.info(f"📊 Avg Brier score (n={scored}): {avg_brier:.4f}")
+                logger.info(f"📊 UpskillBot Avg Brier score (n={scored}): {avg_brier:.4f}")
                 for rec in self._prediction_records:
                     if "brier_score" in rec:
                         logger.info(
@@ -436,12 +436,12 @@ class TavilyResearchBot2025(ForecastBot):
                         )
 
         except Exception as e:
-            logger.error(f"Brier computation failed: {e}")
+            logger.error(f"UpskillBot: Brier computation failed: {e}")
 
     # ===== POST-RUN OUTPUT =====
-    def export_predictions_to_csv(self, filepath: str = "forecasts_output.csv"):
+    def export_predictions_to_csv(self, filepath: str = "upskill_bot_forecasts.csv"):  # ✅ Updated filename
         if not self._prediction_records:
-            logger.warning("No predictions to export.")
+            logger.warning("UpskillBot: No predictions to export.")
             return
 
         # Normalize records into flat dict
@@ -452,7 +452,7 @@ class TavilyResearchBot2025(ForecastBot):
 
         df = pd.DataFrame(flat_records)
         df.to_csv(filepath, index=False)
-        logger.info(f"✅ Exported {len(df)} predictions to {filepath}")
+        logger.info(f"✅ UpskillBot exported {len(df)} predictions to {filepath}")
 
         # Optional: log summary stats
         binary = df[df["type"] == "BinaryQuestion"]
@@ -470,12 +470,12 @@ class TavilyResearchBot2025(ForecastBot):
         all_reports = []
         for tid in tournament_ids:
             try:
-                logger.info(f"▶ Forecasting tournament: {tid}")
+                logger.info(f"▶ UpskillBot forecasting tournament: {tid}")
                 reports = await self.forecast_on_tournament(tid, return_exceptions=True)
                 all_reports.extend(reports)
-                logger.info(f"✅ Done with {tid}")
+                logger.info(f"✅ UpskillBot done with {tid}")
             except Exception as e:
-                logger.error(f"💥 Tournament {tid} failed: {e}")
+                logger.error(f"💥 UpskillBot: Tournament {tid} failed: {e}")
 
         # Post-run: Brier + CSV
         await self._compute_brier_scores()
@@ -497,7 +497,7 @@ if __name__ == "__main__":
     token = os.getenv("METACULUS_TOKEN")
 
     if not (token or (email and password)):
-        logger.warning("No Metaculus credentials — publishing & Brier scores disabled.")
+        logger.warning("UpskillBot: No Metaculus credentials — publishing & Brier scores disabled.")
     else:
         try:
             api = MetaculusApi()
@@ -505,13 +505,13 @@ if __name__ == "__main__":
                 api.login_with_token(token)
             else:
                 api.login(email, password)
-            logger.info("✅ Metaculus auth successful.")
+            logger.info("✅ UpskillBot: Metaculus auth successful.")
         except Exception as e:
-            logger.error(f"Metaculus login failed: {e}")
+            logger.error(f"UpskillBot: Metaculus login failed: {e}")
 
     # 🤖 Bot setup
     GPT5 = "openrouter/openai/gpt-5"
-    bot = TavilyResearchBot2025(
+    bot = UpskillBot(  # ✅ Instantiated as UpskillBot
         research_reports_per_question=1,
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
@@ -528,4 +528,6 @@ if __name__ == "__main__":
     tournament_ids = [32916, "ACX2026", "minibench"]
 
     # 🚀 Run
+    logger.info("🚀 Starting UpskillBot forecast run...")
     asyncio.run(bot.run_all_tournaments(tournament_ids))
+    logger.info("🏁 UpskillBot run completed.")
