@@ -121,7 +121,7 @@ def build_tavily_query(question: MetaculusQuestion, max_chars: int = 397) -> str
 
 
 # -----------------------------
-# UPSKILL BOT — GPT-5/5.1 + Claude Sonnet 4.5 Forecasters Only
+# UPSKILL BOT — FINAL FIXED VERSION
 # -----------------------------
 class UpskillBot(ForecastBot):
     _max_concurrent_questions = 1
@@ -138,13 +138,14 @@ class UpskillBot(ForecastBot):
         self._tavily_lock = asyncio.Lock()
         self._prediction_records: List[Dict[str, Any]] = []
 
+    # ✅ FIXED: Added 'summarizer' (required by ForecastBot base class)
     def _llm_config_defaults(self) -> dict[str, str]:
-        # ✅ Core: GPT-5 (research), GPT-5.1 (main forecast), Claude Sonnet 4.5 (committee only)
         return {
-            "default": "openrouter/openai/gpt-5.1",        # 🧠 Main forecaster (newer than GPT-5)
-            "parser": "openrouter/openai/gpt-4.1-mini",    # 📐 Best for structured output (keep)
-            "researcher_gpt": "openrouter/openai/gpt-5",   # 🔍 Slightly cheaper for research
-            "researcher_claude": "openrouter/anthropic/claude-sonnet-4.5",  # 🔍 Research supplement
+            "default": "openrouter/openai/gpt-5.1",        # Main forecaster
+            "parser": "openrouter/openai/gpt-4.1-mini",    # Structured output
+            "researcher_gpt": "openrouter/openai/gpt-5",   # Research
+            "researcher_claude": "openrouter/anthropic/claude-sonnet-4.5",  # Research
+            "summarizer": "openrouter/openai/gpt-4.1-mini",  # 🔑 CRITICAL: For research summarization
         }
 
     async def _tavily_search_limited(self, query: str) -> dict:
@@ -187,7 +188,7 @@ class UpskillBot(ForecastBot):
                 tavily_summary = f"Answer: {answer}\n" + ("\n".join(snippets) if snippets else "[No results]")
             except Exception as e:
                 error_msg = str(e)
-                logger.error(f"Tavily failed Q{question.id}: {error_msg}")
+                logger.error(f"Tavily failed Q{getattr(question, 'id', 'unknown')}: {error_msg}")
                 if "400 characters" in error_msg:
                     try:
                         short_query = textwrap.shorten(query, width=200, placeholder="…")
@@ -199,7 +200,7 @@ class UpskillBot(ForecastBot):
                 else:
                     tavily_summary = f"[Tavily error: {error_msg}]"
 
-            # ✅ Research: GPT-5 + Claude Sonnet 4.5 (only for supplement — not main forecast)
+            # Research supplements
             gpt_prompt = clean_indents(f"""
                 Superforecaster. Today: {datetime.now().strftime('%Y-%m-%d')}.
                 Question: {question.question_text}
@@ -229,6 +230,37 @@ class UpskillBot(ForecastBot):
                 """
             )
 
+    # ✅ FIXED: Safe _record_prediction (no more AttributeError)
+    def _record_prediction(
+        self,
+        question: MetaculusQuestion,
+        prob: Optional[float],
+        reasoning: str,
+        extra: Optional[Dict] = None,
+    ):
+        try:
+            # Ultra-safe ID extraction
+            qid = getattr(question, "id", None)
+            if qid is None:
+                qid = getattr(question, "question_id", f"anon_{hash(question.question_text) % 10000}")
+            
+            record = {
+                "question_id": qid,
+                "page_url": getattr(question, "page_url", "N/A"),
+                "title": getattr(question, "question_text", "Unknown Question")[:100],
+                "type": question.__class__.__name__,
+                "predicted_prob": prob,
+                "predicted_at": datetime.now(timezone.utc).isoformat(),
+                "tavily_queries_used": self._tavily_query_count,
+                "is_stock": self._is_stock_question(question),
+                "reasoning_snippet": reasoning[:500].replace("\n", " "),
+            }
+            if extra:
+                record.update(extra)
+            self._prediction_records.append(record)
+        except Exception as e:
+            logger.debug(f"Non-fatal: Skipped recording prediction ({e})")
+
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
@@ -245,8 +277,10 @@ class UpskillBot(ForecastBot):
             )
             prob = max(0.01, min(0.99, pred.prediction_in_decimal))
         except Exception as e:
-            logger.warning(f"Binary parse fail Q{question.id}: {e}")
+            logger.warning(f"Binary parse fail Q{getattr(question, 'id', 'unknown')}: {e}")
             prob = 0.5
+
+        # ✅ Safe call
         self._record_prediction(question, prob, reasoning)
         return ReasonedPrediction(prediction_value=prob, reasoning=reasoning)
 
@@ -268,7 +302,7 @@ class UpskillBot(ForecastBot):
                 additional_instructions=f"Options: {question.options}"
             )
         except Exception as e:
-            logger.warning(f"MC parse fail Q{question.id}: {e}")
+            logger.warning(f"MC parse fail Q{getattr(question, 'id', 'unknown')}: {e}")
             pred = PredictedOptionList(
                 predicted_options=[
                     PredictedOption(option_name=opt, probability=round(100.0 / len(question.options), 1))
@@ -279,6 +313,8 @@ class UpskillBot(ForecastBot):
         prob_dict = {opt.option_name: opt.probability for opt in pred.predicted_options}
         top_opt = max(prob_dict, key=prob_dict.get)
         top_prob = prob_dict[top_opt] / 100.0
+
+        # ✅ Safe call
         self._record_prediction(question, top_prob, reasoning, extra={"top_option": top_opt})
         return ReasonedPrediction(prediction_value=pred, reasoning=reasoning)
 
@@ -309,24 +345,25 @@ class UpskillBot(ForecastBot):
             )
             dist = NumericDistribution.from_question(pct_list, question)
         except Exception as e:
-            logger.warning(f"Numeric parse fail Q{question.id}: {e}")
+            logger.warning(f"Numeric parse fail Q{getattr(question, 'id', 'unknown')}: {e}")
             lo, hi = question.lower_bound, question.upper_bound
             fallback = [Percentile(p, lo + (hi - lo) * p / 100) for p in [10,20,40,60,80,90]]
             dist = NumericDistribution.from_question(fallback, question)
 
         median_val = dist.get_percentile_value(50)
+
+        # ✅ Safe call
         self._record_prediction(question, None, reasoning, extra={"median": median_val})
         return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
 
     # -----------------------------
-    # COMMITTEE: GPT-5, GPT-5.1, CLAUDE SONNET 4.5 (forecaster only)
+    # COMMITTEE: GPT-5, GPT-5.1, CLAUDE SONNET 4.5
     # -----------------------------
     async def _make_prediction(self, question: MetaculusQuestion, research: str):
-        # ✅ ONLY these 3 models — all top-tier forecasters
         models = [
-            "openrouter/openai/gpt-5",                  # Forecaster 1
-            "openrouter/openai/gpt-5.1",                # Forecaster 2 (main)
-            "openrouter/anthropic/claude-sonnet-4.5",   # Forecaster 3
+            "openrouter/openai/gpt-5",
+            "openrouter/openai/gpt-5.1",
+            "openrouter/anthropic/claude-sonnet-4.5",
         ]
         predictions = []
         reasonings = []
@@ -335,7 +372,7 @@ class UpskillBot(ForecastBot):
             original_default = self._llms.get("default")
             original_parser = self._llms.get("parser")
             self._llms["default"] = GeneralLlm(model=model)
-            self._llms["parser"] = GeneralLlm(model="openrouter/openai/gpt-4.1-mini")  # keep optimal parser
+            self._llms["parser"] = GeneralLlm(model="openrouter/openai/gpt-4.1-mini")
 
             try:
                 if isinstance(question, BinaryQuestion):
@@ -352,7 +389,7 @@ class UpskillBot(ForecastBot):
                 self._llms["default"] = original_default
                 self._llms["parser"] = original_parser
 
-        # Median aggregation (same as Yrambot)
+        # Median aggregation
         if isinstance(question, BinaryQuestion):
             median_val = median([p for p in predictions])
             return ReasonedPrediction(prediction_value=median_val, reasoning=" | ".join(reasonings))
@@ -391,35 +428,13 @@ class UpskillBot(ForecastBot):
             return ReasonedPrediction(prediction_value=predictions[0], reasoning=" | ".join(reasonings))
 
     # -----------------------------
-    # RECORDING & EXPORT
+    # POST-RUN
     # -----------------------------
-    def _record_prediction(
-        self,
-        question: MetaculusQuestion,
-        prob: Optional[float],
-        reasoning: str,
-        extra: Optional[Dict] = None,
-    ):
-        record = {
-            "question_id": getattr(question, "id", "unknown"),
-            "page_url": getattr(question, "page_url", "N/A"),
-            "title": getattr(question, "question_text", "Unknown")[:100],
-            "type": question.__class__.__name__,
-            "predicted_prob": prob,
-            "predicted_at": datetime.now(timezone.utc).isoformat(),
-            "tavily_queries_used": self._tavily_query_count,
-            "is_stock": self._is_stock_question(question),
-            "reasoning_snippet": reasoning[:500].replace("\n", " "),
-        }
-        if extra:
-            record.update(extra)
-        self._prediction_records.append(record)
-
     async def _compute_brier_scores(self):
         try:
             api = MetaculusApi()
             binary_records = [r for r in self._prediction_records if r["type"] == "BinaryQuestion" and r["predicted_prob"] is not None]
-            question_ids = [r["question_id"] for r in binary_records if isinstance(r["question_id"], int)]
+            question_ids = [r["question_id"] for r in binary_records if isinstance(r["question_id"], (int, str)) and r["question_id"] not in ("N/A", "unknown")]
             if not question_ids:
                 return
             resolved_qs = await api.get_questions_by_ids(question_ids)
@@ -465,7 +480,10 @@ if __name__ == "__main__":
     if os.getenv("METACULUS_TOKEN") or (os.getenv("METACULUS_EMAIL") and os.getenv("METACULUS_PASSWORD")):
         try:
             api = MetaculusApi()
-            api.login_with_token(os.getenv("METACULUS_TOKEN")) if os.getenv("METACULUS_TOKEN") else api.login(os.getenv("METACULUS_EMAIL"), os.getenv("METACULUS_PASSWORD"))
+            if os.getenv("METACULUS_TOKEN"):
+                api.login_with_token(os.getenv("METACULUS_TOKEN"))
+            else:
+                api.login(os.getenv("METACULUS_EMAIL"), os.getenv("METACULUS_PASSWORD"))
             logger.info("✅ Metaculus auth successful.")
         except Exception as e:
             logger.error(f"Metaculus login failed: {e}")
@@ -480,10 +498,11 @@ if __name__ == "__main__":
             "parser": GeneralLlm(model="openrouter/openai/gpt-4.1-mini", temperature=0.0),
             "researcher_gpt": GeneralLlm(model="openrouter/openai/gpt-5", temperature=0.3),
             "researcher_claude": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.5", temperature=0.3),
+            "summarizer": GeneralLlm(model="openrouter/openai/gpt-4.1-mini", temperature=0.0),  # ✅ Explicitly set
         },
     )
 
     tournament_ids = [32916, "ACX2026", "minibench"]
-    logger.info("🚀 Starting UpskillBot (GPT-5/5.1 + Claude Sonnet 4.5 forecasters)...")
+    logger.info("🚀 Starting UpskillBot (GPT-5/5.1 + Claude Sonnet 4.5)...")
     asyncio.run(bot.run_all_tournaments(tournament_ids))
-    logger.info("🏁 UpskillBot run completed.")
+    logger.info("🏁 UpskillBot run completed successfully.")
