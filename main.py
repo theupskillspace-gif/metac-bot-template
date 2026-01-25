@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import logging
@@ -37,13 +36,13 @@ try:
         structure_output,
     )
 except ImportError as e:
-    raise ImportError("Failed to import forecasting_tools. Ensure it's installed and up-to-date.") from e
+    raise ImportError("Failed to import forecasting_tools.") from e
 
 for name in ["NumericQuestion", "BinaryQuestion", "MultipleChoiceQuestion", "PredictedOptionList"]:
     if name not in globals():
         raise NameError(f"Type '{name}' not imported.")
 
-# Rich for dashboard
+# Rich for dashboard (optional)
 try:
     from rich.console import Console
     from rich.table import Table
@@ -55,7 +54,7 @@ except ImportError:
     RICH_AVAILABLE = False
     Console = Live = Panel = Text = lambda *args, **kwargs: None
 
-# Tiktoken for cost tracking
+# Tiktoken for cost tracking (optional)
 try:
     import tiktoken
     TIKTOKEN_AVAILABLE = True
@@ -81,7 +80,6 @@ MODEL_WEIGHTS = {
 
 # ------------------------------------------------------------------
 # MONKEY-PATCH: Fix PredictedOptionList validator
-# ⚠️ WARNING: Fragile—may break with Pydantic updates.
 # ------------------------------------------------------------------
 @model_validator(mode='after')
 def _normalize_probs(self: PredictedOptionList):
@@ -172,7 +170,7 @@ def strict_truncate_query(base: str, suffix: str = "", max_len: int = 395) -> st
 
 
 # -----------------------------
-# UPSKILL BOT — FINAL EDITION
+# UPSKILL BOT — FINAL CLEANED VERSION
 # -----------------------------
 class UpskillBot(ForecastBot):
     _max_concurrent_questions = 1
@@ -188,7 +186,7 @@ class UpskillBot(ForecastBot):
         self._max_tavily_queries = 400
         self._tavily_lock = asyncio.Lock()
         self._prediction_records: List[Dict[str, Any]] = []
-        self._research_cache: Dict[str, str] = []
+        self._research_cache: Dict[str, str] = {}  # ✅ FIXED: was [] before!
 
         # Cost tracking
         self._cost_tracker = {}
@@ -655,8 +653,8 @@ class UpskillBot(ForecastBot):
 
     async def _compute_brier_scores(self):
         try:
-            token = os.getenv("METACULUS_TOKEN")
-            client = MetaculusClient(token=token) if token else MetaculusClient()
+            # Use MetaculusClient without auth (public questions only)
+            client = MetaculusClient()
             binary_records = [
                 r for r in self._prediction_records
                 if r["type"] == "BinaryQuestion" and r["predicted_prob"] is not None
@@ -801,24 +799,6 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
-    metaculus_client = None
-    token = os.getenv("METACULUS_TOKEN")
-    if token:
-        try:
-            metaculus_client = MetaculusClient(token=token)
-            logger.info("✅ Metaculus auth successful.")
-        except Exception as e:
-            logger.error(f"Metaculus login failed: {e}")
-    else:
-        email = os.getenv("METACULUS_EMAIL")
-        password = os.getenv("METACULUS_PASSWORD")
-        if email and password:
-            try:
-                metaculus_client = MetaculusClient(email=email, password=password)
-                logger.info("✅ Metaculus auth successful.")
-            except Exception as e:
-                logger.error(f"Metaculus login failed: {e}")
-
     bot = UpskillBot(
         research_reports_per_question=1,
         predictions_per_research_report=1,
@@ -834,6 +814,6 @@ if __name__ == "__main__":
     )
 
     tournament_ids = [32916, "ACX2026", "minibench", "market-pulse-26q1"]
-    logger.info("🚀 Starting UpskillBot (Superforecaster Edition with Cost Tracking)...")
+    logger.info("🚀 Starting UpskillBot (Final Clean Version)...")
     asyncio.run(bot.run_all_tournaments(tournament_ids))
     logger.info("🏁 UpskillBot run completed successfully.")
