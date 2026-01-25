@@ -9,7 +9,7 @@ import os
 import re
 import textwrap
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import pandas as pd
 from tavily import TavilyClient
@@ -23,7 +23,7 @@ try:
         BinaryQuestion,
         ForecastBot,
         GeneralLlm,
-        MetaculusApi,
+        MetaculusClient,
         MetaculusQuestion,
         MultipleChoiceQuestion,
         NumericDistribution,
@@ -37,11 +37,30 @@ try:
         structure_output,
     )
 except ImportError as e:
-    raise ImportError("Failed to import forecasting_tools.") from e
+    raise ImportError("Failed to import forecasting_tools. Ensure it's installed and up-to-date.") from e
 
 for name in ["NumericQuestion", "BinaryQuestion", "MultipleChoiceQuestion", "PredictedOptionList"]:
     if name not in globals():
         raise NameError(f"Type '{name}' not imported.")
+
+# Rich for dashboard
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.text import Text
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+    Console = Live = Panel = Text = lambda *args, **kwargs: None
+
+# Tiktoken for cost tracking
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
 
 logger = logging.getLogger("UpskillBot")
 
@@ -54,7 +73,6 @@ RESEARCHER_GPT = "openrouter/openai/gpt-5"
 RESEARCHER_CLAUDE = "openrouter/anthropic/claude-sonnet-4.5"
 SUMMARIZER_MODEL = "openrouter/openai/gpt-4.1-mini"
 
-# Model weights for weighted aggregation (higher = more trusted)
 MODEL_WEIGHTS = {
     RESEARCHER_GPT: 0.2,
     DEFAULT_FORECASTER: 0.5,
@@ -63,6 +81,7 @@ MODEL_WEIGHTS = {
 
 # ------------------------------------------------------------------
 # MONKEY-PATCH: Fix PredictedOptionList validator
+# ⚠️ WARNING: Fragile—may break with Pydantic updates.
 # ------------------------------------------------------------------
 @model_validator(mode='after')
 def _normalize_probs(self: PredictedOptionList):
@@ -100,9 +119,9 @@ def median(lst: List[float]) -> float:
 
 
 # -----------------------------
-# TAVILY QUERY BUILDER
+# SAFE TAVILY QUERY BUILDER
 # -----------------------------
-def build_tavily_query(question: MetaculusQuestion, max_chars: int = 397) -> str:
+def build_tavily_query(question: MetaculusQuestion, max_chars: int = 300) -> str:
     q = question.question_text.strip()
     bg = (question.background_info or "").strip()
     q = re.sub(r"http\S+", "", q)
@@ -138,7 +157,22 @@ def build_tavily_query(question: MetaculusQuestion, max_chars: int = 397) -> str
 
 
 # -----------------------------
-# UPSKILL BOT — SUPERFORECASTER EDITION
+# STRICT QUERY TRUNCATION
+# -----------------------------
+def strict_truncate_query(base: str, suffix: str = "", max_len: int = 395) -> str:
+    full = f"{base} {suffix}".strip()
+    if len(full) <= max_len:
+        return full
+    available = max_len - len(suffix) - 1
+    if available <= 0:
+        return textwrap.shorten(suffix, width=max_len, placeholder="…")
+    truncated_base = textwrap.shorten(base, width=available, placeholder="…")
+    result = f"{truncated_base} {suffix}".strip()
+    return result[:max_len]
+
+
+# -----------------------------
+# UPSKILL BOT — FINAL EDITION
 # -----------------------------
 class UpskillBot(ForecastBot):
     _max_concurrent_questions = 1
@@ -154,7 +188,23 @@ class UpskillBot(ForecastBot):
         self._max_tavily_queries = 400
         self._tavily_lock = asyncio.Lock()
         self._prediction_records: List[Dict[str, Any]] = []
-        self._research_cache: Dict[str, str] = {}
+        self._research_cache: Dict[str, str] = []
+
+        # Cost tracking
+        self._cost_tracker = {}
+        self._model_pricing = {
+            "gpt-4.1-mini": {"input": 0.15, "output": 0.60},
+            "gpt-5": {"input": 3.00, "output": 12.00},
+            "gpt-5.1": {"input": 5.00, "output": 15.00},
+            "claude-sonnet-4.5": {"input": 3.00, "output": 15.00},
+        }
+        self._encoding_cache = {}
+
+        # Dashboard
+        self._console = Console() if RICH_AVAILABLE else None
+        self._live_display = None
+        self._questions_processed = 0
+        self._questions_total = 0
 
     def _llm_config_defaults(self) -> dict[str, str]:
         return {
@@ -164,6 +214,48 @@ class UpskillBot(ForecastBot):
             "researcher_claude": RESEARCHER_CLAUDE,
             "summarizer": SUMMARIZER_MODEL,
         }
+
+    def _get_encoding(self, model_name: str):
+        if not TIKTOKEN_AVAILABLE:
+            return None
+        if model_name in self._encoding_cache:
+            return self._encoding_cache[model_name]
+        if "gpt-4" in model_name or "gpt-5" in model_name:
+            enc = tiktoken.get_encoding("cl100k_base")
+        elif "claude" in model_name:
+            enc = tiktoken.get_encoding("cl100k_base")
+        else:
+            enc = tiktoken.get_encoding("cl100k_base")
+        self._encoding_cache[model_name] = enc
+        return enc
+
+    def _estimate_cost(self, model_path: str, prompt: str, completion: str) -> float:
+        if not TIKTOKEN_AVAILABLE:
+            return 0.0
+        if model_path not in self._cost_tracker:
+            self._cost_tracker[model_path] = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+        
+        model_key = model_path.split("/")[-1]
+        pricing = self._model_pricing.get(model_key, {"input": 1.0, "output": 3.0})
+        enc = self._get_encoding(model_key)
+        if not enc:
+            return 0.0
+
+        input_tokens = len(enc.encode(prompt))
+        output_tokens = len(enc.encode(completion))
+
+        self._cost_tracker[model_path]["input_tokens"] += input_tokens
+        self._cost_tracker[model_path]["output_tokens"] += output_tokens
+        self._cost_tracker[model_path]["calls"] += 1
+
+        cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+        return cost
+
+    async def _invoke_with_cost_tracking(self, model_name: str, prompt: str) -> str:
+        llm = self.get_llm(model_name, "llm")
+        response = await llm.invoke(prompt)
+        self._estimate_cost(llm.model, prompt, response)
+        return response
 
     async def _tavily_search_limited(self, query: str, **kwargs) -> dict:
         async with self._tavily_lock:
@@ -182,7 +274,6 @@ class UpskillBot(ForecastBot):
         return any(re.search(pat, text) for pat in patterns)
 
     def _estimate_question_difficulty(self, question: MetaculusQuestion) -> float:
-        """Estimate epistemic difficulty (0–1)."""
         text = (question.question_text + " " + (question.background_info or "")).lower()
         now = datetime.now(timezone.utc)
         days_to_close = (question.close_time - now).total_seconds() / 86400 if question.close_time else 365
@@ -190,6 +281,46 @@ class UpskillBot(ForecastBot):
         long_horizon = days_to_close > 365
         vague_resolution = "ambiguous" in (question.resolution_criteria or "").lower()
         return min(1.0, 0.3 + 0.3 * long_horizon + 0.2 * base_rate_hint + 0.2 * vague_resolution)
+
+    def _get_numeric_median(self, dist: NumericDistribution) -> float:
+        """Safely extract median from NumericDistribution."""
+        for p in dist.declared_percentiles:
+            if abs(p.percentile - 0.5) < 0.01 or abs(p.percentile - 50.0) < 1.0:
+                return float(p.value)
+        sorted_pts = sorted(dist.declared_percentiles, key=lambda x: x.percentile)
+        if not sorted_pts:
+            return 0.0
+        normalized = []
+        for pt in sorted_pts:
+            perc = pt.percentile / 100.0 if pt.percentile > 1.0 else pt.percentile
+            normalized.append(Percentile(percentile=perc, value=pt.value))
+        if len(normalized) == 1:
+            return normalized[0].value
+        if normalized[0].percentile >= 0.5:
+            return normalized[0].value
+        if normalized[-1].percentile <= 0.5:
+            return normalized[-1].value
+        for i in range(len(normalized) - 1):
+            p1, p2 = normalized[i], normalized[i + 1]
+            if p1.percentile <= 0.5 <= p2.percentile:
+                frac = (0.5 - p1.percentile) / (p2.percentile - p1.percentile)
+                return p1.value + frac * (p2.value - p1.value)
+        return normalized[-1].value
+
+    def _interpolate_percentile(self, percentiles: List[Percentile], target_p: float) -> float:
+        sorted_pts = sorted(percentiles, key=lambda x: x.percentile)
+        if not sorted_pts:
+            return 0.0
+        if target_p <= sorted_pts[0].percentile:
+            return sorted_pts[0].value
+        if target_p >= sorted_pts[-1].percentile:
+            return sorted_pts[-1].value
+        for i in range(len(sorted_pts) - 1):
+            p1, p2 = sorted_pts[i], sorted_pts[i + 1]
+            if p1.percentile <= target_p <= p2.percentile:
+                frac = (target_p - p1.percentile) / (p2.percentile - p1.percentile)
+                return p1.value + frac * (p2.value - p1.value)
+        return sorted_pts[-1].value
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         qid = getattr(question, "id", getattr(question, "question_id", hash(question.question_text)))
@@ -201,48 +332,47 @@ class UpskillBot(ForecastBot):
             today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             base_query = build_tavily_query(question)
 
-            # Two-pronged search: recent + historical
             recent_summary = "[Recent developments pending]"
-            historical_summary = "[Historical trends pending]"
-
             try:
+                recent_query = strict_truncate_query(base_query, "Focus on developments in the last 6 months.", 395)
                 recent = await self._tavily_search_limited(
-                    base_query + " Focus on developments in the last 6 months.",
+                    recent_query,
                     search_depth="advanced",
                     max_results=3,
                     days=180,
                 )
-                recent_snippets = [
+                snippets = [
                     f"[{i+1}] {r['title']}: {textwrap.shorten(r['content'], width=150, placeholder='…')}"
                     for i, r in enumerate(recent.get("results", [])[:3])
                 ]
-                recent_summary = ("\n".join(recent_snippets) if recent_snippets else "[No recent results]")
+                recent_summary = ("\n".join(snippets) if snippets else "[No recent results]")
             except Exception as e:
                 logger.error(f"Recent Tavily failed: {e}")
                 recent_summary = f"[Error: {e}]"
 
+            historical_summary = "[Historical trends pending]"
             try:
+                historical_query = strict_truncate_query(base_query, "What is the historical base rate or long-term trend?", 395)
                 historical = await self._tavily_search_limited(
-                    base_query + " What is the historical base rate or long-term trend?",
+                    historical_query,
                     search_depth="advanced",
                     max_results=3,
                 )
-                hist_snippets = [
+                snippets = [
                     f"[{i+1}] {r['title']}: {textwrap.shorten(r['content'], width=150, placeholder='…')}"
                     for i, r in enumerate(historical.get("results", [])[:3])
                 ]
-                historical_summary = ("\n".join(hist_snippets) if hist_snippets else "[No historical data]")
+                historical_summary = ("\n".join(snippets) if snippets else "[No historical data]")
             except Exception as e:
                 logger.error(f"Historical Tavily failed: {e}")
                 historical_summary = f"[Error: {e}]"
 
-            # Base rate estimation via LLM
             base_rate_prompt = clean_indents(f"""
                 Estimate the historical base rate of events like this.
                 Use only general knowledge or inferred trends.
                 Output format: "Base rate: X%" or "Unknown".
             """)
-            base_rate = await self.get_llm("researcher_gpt", "llm").invoke(base_rate_prompt)
+            base_rate = await self._invoke_with_cost_tracking("researcher_gpt", base_rate_prompt)
 
             gpt_prompt = clean_indents(f"""
                 You are a Good Judgment Project forecaster. Today: {datetime.now().strftime('%Y-%m-%d')}.
@@ -250,13 +380,13 @@ class UpskillBot(ForecastBot):
                 Background: {question.background_info or 'None'}
                 Be evidence-based, avoid narrative fallacy, anchor to base rates.
             """)
+            gpt_response = await self._invoke_with_cost_tracking("researcher_gpt", gpt_prompt)
+
             claude_prompt = clean_indents(f"""
                 Claude Sonnet 4.5. Analyze key uncertainties and structural drivers.
                 Output only high-signal insights.
             """)
-
-            gpt_response = await self.get_llm("researcher_gpt", "llm").invoke(gpt_prompt)
-            claude_response = await self.get_llm("researcher_claude", "llm").invoke(claude_prompt)
+            claude_response = await self._invoke_with_cost_tracking("researcher_claude", claude_prompt)
 
             full_research = clean_indents(
                 f"""
@@ -319,35 +449,12 @@ class UpskillBot(ForecastBot):
         except Exception as e:
             logger.debug(f"Non-fatal: Skipped recording prediction ({e})")
 
-    def _interpolate_percentile(self, percentiles: List[Percentile], target_p: float) -> float:
-        sorted_pts = sorted(percentiles, key=lambda x: x.percentile)
-        if not sorted_pts:
-            return 0.0
-        if target_p <= sorted_pts[0].percentile:
-            return sorted_pts[0].value
-        if target_p >= sorted_pts[-1].percentile:
-            return sorted_pts[-1].value
-        for i in range(len(sorted_pts) - 1):
-            p1, p2 = sorted_pts[i], sorted_pts[i + 1]
-            if p1.percentile <= target_p <= p2.percentile:
-                frac = (target_p - p1.percentile) / (p2.percentile - p1.percentile)
-                return p1.value + frac * (p2.value - p1.value)
-        return sorted_pts[-1].value
-
     async def _run_forecast_with_red_team(
         self, question: MetaculusQuestion, research: str, is_binary: bool = True
     ) -> Tuple[str, float]:
-        # Step 1: Initial forecast with decomposition
         today = datetime.now().strftime('%Y-%m-%d')
-        decompose_instr = (
-            "Decompose into 3–5 key factors. Estimate each. Then synthesize."
-            if not isinstance(question, MultipleChoiceQuestion)
-            else ""
-        )
-        calib_instr = (
-            "You are calibrated: your 70% predictions resolve ~70% of the time. "
-            "Avoid overconfidence. Anchor to base rates."
-        )
+        decompose_instr = "Decompose into 3–5 key factors. Estimate each. Then synthesize."
+        calib_instr = "You are calibrated: your 70% predictions resolve ~70% of the time. Avoid overconfidence."
 
         initial_prompt = clean_indents(f"""
             You are a superforecaster trained on the Good Judgment Project. Today: {today}.
@@ -355,18 +462,16 @@ class UpskillBot(ForecastBot):
             Research: {research}
             {decompose_instr}
             {calib_instr}
-            Final line: "Probability: ZZ%" (binary) or option probabilities (MCQ).
+            Final line: "Probability: ZZ%"
         """)
-        initial_reasoning = await self.get_llm("default", "llm").invoke(initial_prompt)
+        initial_reasoning = await self._invoke_with_cost_tracking("default", initial_prompt)
 
-        # Step 2: Red team challenge
         red_team_prompt = clean_indents(f"""
             You are a skeptical expert who believes the above forecast is wrong.
             List 3 strongest counterarguments and evidence that would falsify it.
         """)
-        red_team_response = await self.get_llm("researcher_claude", "llm").invoke(red_team_prompt)
+        red_team_response = await self._invoke_with_cost_tracking("researcher_claude", red_team_prompt)
 
-        # Step 3: Revise
         final_prompt = clean_indents(f"""
             Original reasoning:
             {initial_reasoning}
@@ -376,9 +481,8 @@ class UpskillBot(ForecastBot):
 
             Revise your forecast if warranted. Keep final line format.
         """)
-        revised_reasoning = await self.get_llm("default", "llm").invoke(final_prompt)
+        revised_reasoning = await self._invoke_with_cost_tracking("default", final_prompt)
 
-        # Extract probability
         prob = 0.5
         try:
             if is_binary:
@@ -401,7 +505,6 @@ class UpskillBot(ForecastBot):
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
-        # For MCQ, skip red team for simplicity (or extend if needed)
         prompt = clean_indents(f"""
             {DEFAULT_FORECASTER.split('/')[-1]} forecaster. Options: {question.options}
             Research: {research}
@@ -410,7 +513,7 @@ class UpskillBot(ForecastBot):
             Option_A: XX%
             Option_B: YY%
         """)
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_with_cost_tracking("default", prompt)
         try:
             pred: PredictedOptionList = await structure_output(
                 reasoning, PredictedOptionList, model=self.get_llm("parser", "llm"),
@@ -445,7 +548,7 @@ class UpskillBot(ForecastBot):
             {lower_msg} {upper_msg}
             Decompose into key drivers. Output percentiles.
         """)
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_with_cost_tracking("default", prompt)
         try:
             pct_list: list[Percentile] = await structure_output(
                 reasoning, list[Percentile], model=self.get_llm("parser", "llm")
@@ -457,7 +560,7 @@ class UpskillBot(ForecastBot):
             fallback = [Percentile(p, lo + (hi - lo) * p / 100) for p in [10,20,40,60,80,90]]
             dist = NumericDistribution.from_question(fallback, question)
 
-        median_val = dist.get_percentile_value(50)
+        median_val = self._get_numeric_median(dist)
         self._record_prediction(question, None, reasoning, extra={"median": median_val})
         return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
 
@@ -489,16 +592,13 @@ class UpskillBot(ForecastBot):
                 self._llms["default"] = original_default
                 self._llms["parser"] = original_parser
 
-        # Weighted aggregation
         if isinstance(question, BinaryQuestion):
-            # Create weighted list for median
             weighted_vals = []
             for pred, model in zip(predictions, model_names):
                 weight = MODEL_WEIGHTS[model]
                 count = max(1, int(weight * 100))
                 weighted_vals.extend([pred] * count)
             median_val = median(weighted_vals)
-            # Compute std dev for confidence
             std_dev = (sum((p - median_val)**2 for p in predictions) / len(predictions)) ** 0.5
             self._record_prediction(question, median_val, " | ".join(reasonings), extra={
                 "prediction_std": std_dev,
@@ -555,7 +655,8 @@ class UpskillBot(ForecastBot):
 
     async def _compute_brier_scores(self):
         try:
-            api = MetaculusApi()
+            token = os.getenv("METACULUS_TOKEN")
+            client = MetaculusClient(token=token) if token else MetaculusClient()
             binary_records = [
                 r for r in self._prediction_records
                 if r["type"] == "BinaryQuestion" and r["predicted_prob"] is not None
@@ -566,7 +667,7 @@ class UpskillBot(ForecastBot):
             ]
             if not question_ids:
                 return
-            all_qs = await api.get_questions_by_ids(question_ids)
+            all_qs = await client.get_questions_by_ids(question_ids)
             resolved_qs = [q for q in all_qs if isinstance(q, BinaryQuestion) and q.resolution in ("yes", "no")]
             brier_sum = log_score_sum = scored = 0.0
             for q in resolved_qs:
@@ -575,7 +676,6 @@ class UpskillBot(ForecastBot):
                     pred = rec["predicted_prob"]
                     actual = 1.0 if q.resolution == "yes" else 0.0
                     brier = (pred - actual) ** 2
-                    # Log score (proper scoring rule)
                     eps = 1e-6
                     clipped_pred = max(eps, min(1 - eps, pred))
                     log_score = actual * math.log(clipped_pred) + (1 - actual) * math.log(1 - clipped_pred)
@@ -613,12 +713,85 @@ class UpskillBot(ForecastBot):
         df.to_csv(filepath, index=False)
         logger.info(f"✅ Exported {len(df)} predictions to {filepath}")
 
+    def export_cost_report(self, filepath: str = "upskill_bot_costs.csv"):
+        if not self._cost_tracker:
+            return
+        records = []
+        total_cost = 0.0
+        for model, stats in self._cost_tracker.items():
+            model_key = model.split("/")[-1]
+            pricing = self._model_pricing.get(model_key, {"input": 1.0, "output": 3.0})
+            cost = (stats["input_tokens"] * pricing["input"] + stats["output_tokens"] * pricing["output"]) / 1_000_000
+            total_cost += cost
+            records.append({
+                "model": model,
+                "calls": stats["calls"],
+                "input_tokens": stats["input_tokens"],
+                "output_tokens": stats["output_tokens"],
+                "estimated_cost_usd": round(cost, 6)
+            })
+        if records:
+            df = pd.DataFrame(records)
+            df.to_csv(filepath, index=False)
+            logger.info(f"✅ Exported cost report to {filepath}")
+            logger.info(f"💰 Total estimated cost: ${total_cost:.4f}")
+
+    def _render_dashboard(self) -> Panel:
+        if not RICH_AVAILABLE:
+            return Panel("Install 'rich' for live dashboard")
+        progress = f"{self._questions_processed}/{self._questions_total}" if self._questions_total else "N/A"
+        total_cost = 0.0
+        cost_table = Table(show_header=True, header_style="bold magenta")
+        cost_table.add_column("Model")
+        cost_table.add_column("Calls")
+        cost_table.add_column("In Tokens")
+        cost_table.add_column("Out Tokens")
+        cost_table.add_column("Est. Cost (USD)")
+        for model, stats in self._cost_tracker.items():
+            model_key = model.split("/")[-1]
+            pricing = self._model_pricing.get(model_key, {"input": 1.0, "output": 3.0})
+            cost = (stats["input_tokens"] * pricing["input"] + stats["output_tokens"] * pricing["output"]) / 1_000_000
+            total_cost += cost
+            cost_table.add_row(
+                model,
+                str(stats["calls"]),
+                f"{stats['input_tokens']:,}",
+                f"{stats['output_tokens']:,}",
+                f"${cost:.4f}"
+            )
+        tavily_info = f"Tavily Queries: {self._tavily_query_count}/{self._max_tavily_queries}"
+        content = Text.assemble(
+            f"Questions Processed: {progress}\n",
+            f"Total Est. Cost: ${total_cost:.4f}\n",
+            tavily_info,
+            "\n\n",
+        )
+        content.append(cost_table)
+        return Panel(content, title="📈 UpskillBot Live Dashboard", border_style="green")
+
+    async def _forecast_single_question(self, question: MetaculusQuestion):
+        self._questions_processed += 1
+        if self._live_display and RICH_AVAILABLE:
+            self._live_display.update(self._render_dashboard())
+        return await super()._forecast_single_question(question)
+
     async def run_all_tournaments(self, tournament_ids: List):
-        for tid in tournament_ids:
-            logger.info(f"▶ Forecasting tournament: {tid}")
-            await self.forecast_on_tournament(tid, return_exceptions=True)
-        await self._compute_brier_scores()
-        self.export_predictions_to_csv()
+        if RICH_AVAILABLE:
+            with Live(self._render_dashboard(), refresh_per_second=1, console=self._console) as live:
+                self._live_display = live
+                for tid in tournament_ids:
+                    logger.info(f"▶ Forecasting tournament: {tid}")
+                    await self.forecast_on_tournament(tid, return_exceptions=True)
+                await self._compute_brier_scores()
+                self.export_predictions_to_csv()
+                self.export_cost_report()
+        else:
+            for tid in tournament_ids:
+                logger.info(f"▶ Forecasting tournament: {tid}")
+                await self.forecast_on_tournament(tid, return_exceptions=True)
+            await self._compute_brier_scores()
+            self.export_predictions_to_csv()
+            self.export_cost_report()
 
 
 # -----------------------------
@@ -628,16 +801,23 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
-    if os.getenv("METACULUS_TOKEN") or (os.getenv("METACULUS_EMAIL") and os.getenv("METACULUS_PASSWORD")):
+    metaculus_client = None
+    token = os.getenv("METACULUS_TOKEN")
+    if token:
         try:
-            api = MetaculusApi()
-            if os.getenv("METACULUS_TOKEN"):
-                api.login_with_token(os.getenv("METACULUS_TOKEN"))
-            else:
-                api.login(os.getenv("METACULUS_EMAIL"), os.getenv("METACULUS_PASSWORD"))
+            metaculus_client = MetaculusClient(token=token)
             logger.info("✅ Metaculus auth successful.")
         except Exception as e:
             logger.error(f"Metaculus login failed: {e}")
+    else:
+        email = os.getenv("METACULUS_EMAIL")
+        password = os.getenv("METACULUS_PASSWORD")
+        if email and password:
+            try:
+                metaculus_client = MetaculusClient(email=email, password=password)
+                logger.info("✅ Metaculus auth successful.")
+            except Exception as e:
+                logger.error(f"Metaculus login failed: {e}")
 
     bot = UpskillBot(
         research_reports_per_question=1,
@@ -653,7 +833,7 @@ if __name__ == "__main__":
         },
     )
 
-    tournament_ids = [32916, "ACX2026", "minibench"]
-    logger.info("🚀 Starting UpskillBot (Superforecaster Edition)...")
+    tournament_ids = [32916, "ACX2026", "minibench", "market-pulse-26q1"]
+    logger.info("🚀 Starting UpskillBot (Superforecaster Edition with Cost Tracking)...")
     asyncio.run(bot.run_all_tournaments(tournament_ids))
     logger.info("🏁 UpskillBot run completed successfully.")
