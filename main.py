@@ -100,7 +100,7 @@ class NormalizedPredictedOptionList(PredictedOptionList):
             return self
 
         # If model returned percentages (e.g., 45, 30, 25)
-        if total > 1.5:
+        if any(p > 1.0 for p in probs) or total > 1.5:
             for opt in self.predicted_options:
                 opt.probability = float(opt.probability) / 100.0
 
@@ -346,26 +346,24 @@ def canonicalize_option_name(name: str) -> str:
 
 def map_to_valid_options(pred: NormalizedPredictedOptionList, valid_options: List[str]) -> NormalizedPredictedOptionList:
     valid_norm = {canonicalize_option_name(o): o for o in valid_options}
-    kept: List[PredictedOption] = []
+    seen: Dict[str, float] = {}
     for opt in pred.predicted_options:
         norm = canonicalize_option_name(opt.option_name)
         if norm in valid_norm:
-            kept.append(PredictedOption(option_name=valid_norm[norm], probability=float(opt.probability)))
+            seen[valid_norm[norm]] = float(opt.probability)
 
-    if not kept:
+    # Ensure all options present; missing get 0.0 then normalize
+    full_probs = [max(0.0, float(seen.get(o, 0.0))) for o in valid_options]
+    s = sum(full_probs)
+    if s <= 0:
         p = 1.0 / max(1, len(valid_options))
-        return NormalizedPredictedOptionList(
-            predicted_options=[PredictedOption(option_name=o, probability=p) for o in valid_options]
-        )
-
-    total = sum(float(o.probability) for o in kept)
-    if total <= 0:
-        p = 1.0 / len(kept)
-        kept = [PredictedOption(option_name=o.option_name, probability=p) for o in kept]
+        full_probs = [p for _ in valid_options]
     else:
-        kept = [PredictedOption(option_name=o.option_name, probability=float(o.probability) / total) for o in kept]
+        full_probs = [p / s for p in full_probs]
 
-    return NormalizedPredictedOptionList(predicted_options=kept)
+    return NormalizedPredictedOptionList(
+        predicted_options=[PredictedOption(option_name=o, probability=float(full_probs[i])) for i, o in enumerate(valid_options)]
+    )
 
 
 # =========================================================
@@ -397,7 +395,7 @@ def rule_archetype(text: str) -> tuple[Optional[Archetype], float]:
         return Archetype.WEATHER_NATURAL, 0.85
 
     # SPORTS/ENT
-    if re.search(r"\b(championship|tournament|world cup|nba|nfl|mlb|nhl|ucl|olympics|oscars?|grammys?|bafta|emmys?|release date)\b", text):
+    if re.search(r"\b(championship|tournament|world cup|nba|nfl|mlb|nhl|ucl|olympics|oscars?|grammys?|bafta|emmys?)\b", text):
         return Archetype.SPORTS_ENT, 0.80
 
     # SCI/TECH
@@ -509,7 +507,6 @@ def extremize_binary(p_raw: float, r: float, tuning: ArchetypeTuning) -> float:
         k = 1.0
     else:
         # scale to max_k
-        # at r=0.65 -> 1.0; at r=1.0 -> tuning.max_k_binary
         frac = (r - 0.65) / 0.35
         k = 1.0 + (tuning.max_k_binary - 1.0) * frac
 
@@ -711,7 +708,15 @@ class UpskillBot(ForecastBot):
         self._archetype_cache[key] = a
         return a
 
-    async def run_research(self, question: MetaculusQuestion, archetype: Archetype) -> str:
+    # -------------------------------
+    # FIX: provide default archetype arg
+    # so ForecastBot callers that call
+    # run_research(question) won't crash
+    # -------------------------------
+    async def run_research(self, question: MetaculusQuestion, archetype: Optional[Archetype] = None) -> str:
+        if archetype is None:
+            archetype = await self.detect_archetype(question)
+
         cache_key = f"{stable_question_cache_key(question)}::{archetype.value}"
         if cache_key in self._research_cache:
             return self._research_cache[cache_key]
@@ -967,14 +972,15 @@ class UpskillBot(ForecastBot):
         p_final = extremize_binary(p_raw, r, tuning)
         p_final = conservative_clip(p_final, lo=tuning.clip_lo, hi=tuning.clip_hi)
 
-        # Replace only final Probability line
-        revised_text = re.sub(
-            r"Probability\s*:\s*[0-9]+(?:\.[0-9]+)?\s*%?\s*$",
-            f"Probability: {p_final*100:.1f}%",
-            revised_text.strip(),
-            flags=re.IGNORECASE | re.MULTILINE,
-            count=1,
-        )
+        # Replace ONLY the last Probability line (avoid earlier matches)
+        matches = list(re.finditer(r"Probability\s*:\s*[0-9]+(?:\.[0-9]+)?\s*%?\s*$",
+                                  revised_text.strip(),
+                                  flags=re.IGNORECASE | re.MULTILINE))
+        if matches:
+            m = matches[-1]
+            revised_text = revised_text[:m.start()] + f"Probability: {p_final*100:.1f}%" + revised_text[m.end():]
+        else:
+            revised_text = revised_text.strip() + f"\nProbability: {p_final*100:.1f}%"
 
         return shorten_reasoning(revised_text, 900), p_final, r
 
@@ -1181,9 +1187,7 @@ class UpskillBot(ForecastBot):
 
     async def _make_prediction(self, question: MetaculusQuestion, research: str):
         """
-        Override: research is now archetype-specific outside this function,
-        but some callers pass research in. We'll detect archetype and ignore
-        the passed research if it doesn't match our archetype cache.
+        Override: detect archetype and use archetype-specific research.
         """
         archetype = await self.detect_archetype(question)
         research2 = await self.run_research(question, archetype)
@@ -1313,7 +1317,7 @@ if __name__ == "__main__":
         },
     )
 
-    tournament_ids = [32916, "ACX2026", "minibench", "market-pulse-26q1"]
+    tournament_ids = [32916, "minibench", "market-pulse-26q1"]
     logger.info("🚀 Starting UpskillBot (type-aware archetypes + calibrated extremization)...")
     asyncio.run(bot.run_all_tournaments(tournament_ids))
     logger.info("🏁 UpskillBot run completed.")
