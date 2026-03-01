@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import asyncio
 import hashlib
 import json
@@ -8,11 +7,14 @@ import math
 import os
 import re
 import textwrap
+import time
+import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import List, Optional, Dict, Any, Tuple
 
+import numpy as np
 import pandas as pd
 import httpx
 from tavily import TavilyClient
@@ -41,20 +43,35 @@ except ImportError as e:
 
 logger = logging.getLogger("UpskillBot")
 
+# =========================================================
+# ⚙️ Configuration
+# =========================================================
 DEFAULT_FORECASTER = "openrouter/anthropic/claude-sonnet-4.5"
 PARSER_MODEL = "openrouter/openai/gpt-4.1-mini"
 SUMMARIZER_MODEL = "openrouter/openai/gpt-4.1-mini"
 
+RESEARCH_TIMEOUT_S = float(os.getenv("RESEARCH_TIMEOUT_S", "25"))
+LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "70"))
+MAX_CONCURRENT_QUESTIONS = int(os.getenv("MAX_CONCURRENT_QUESTIONS", "1"))
+RETRY_MAX = int(os.getenv("RETRY_MAX", "6"))
+RETRY_BASE_S = float(os.getenv("RETRY_BASE_S", "2.0"))
+RETRY_MAX_S = float(os.getenv("RETRY_MAX_S", "60.0"))
+
+MIN_P = float(os.getenv("MIN_P", "0.01"))
+MAX_P = float(os.getenv("MAX_P", "0.99"))
+
+CALIBRATION_LOG_FILE = "upskill_calibration_log.jsonl"
+PREDICTIONS_CSV_FILE = "upskill_bot_forecasts.csv"
+COSTS_CSV_FILE = "upskill_bot_costs.csv"
 
 # =========================================================
-# 🔍 EXA SEARCHER
+# 🔍 Exa Searcher
 # =========================================================
 class ExaSearcher:
     """
     Lightweight async client for Exa search.
     Requires EXA_API_KEY env var; if missing, Exa search is skipped gracefully.
     """
-
     def __init__(self):
         self.api_key = os.getenv("EXA_API_KEY")
         self.base_url = "https://api.exa.ai/search"
@@ -84,14 +101,14 @@ class ExaSearcher:
 
 
 # =========================================================
-# ✅ Normalized multiple choice model (Pydantic v2-safe)
+# ✅ Normalized Multiple Choice Model (Pydantic v2-safe)
 # =========================================================
 class NormalizedPredictedOptionList(PredictedOptionList):
     @model_validator(mode="after")
     def normalize_probs(self):
         if not getattr(self, "predicted_options", None):
             return self
-
+        
         probs = [float(p.probability) for p in self.predicted_options]
         total = sum(probs)
 
@@ -123,7 +140,7 @@ class NormalizedPredictedOptionList(PredictedOptionList):
 
 
 # =========================================================
-# 🧠 Archetypes (forecasting-structure types)
+# 🧠 Archetypes (Forecasting Structure Types)
 # =========================================================
 class Archetype(str, Enum):
     MARKET = "market"
@@ -238,13 +255,12 @@ def archetype_tuning(a: Archetype) -> ArchetypeTuning:
 # 🧰 Helpers
 # =========================================================
 def build_tavily_query(question: MetaculusQuestion, max_chars: int = 300) -> str:
-    q = (question.question_text or "").strip()
-    bg = (question.background_info or "").strip()
-    q = re.sub(r"http\S+", "", q)
-    bg = re.sub(r"http\S+", "", bg)
+    q = (question.question_text or " ").strip()
+    bg = (question.background_info or " ").strip()
+    q = re.sub(r"http\S+", " ", q)
+    bg = re.sub(r"http\S+", " ", bg)
     q = re.sub(r"\s+", " ", q).strip()
     bg = re.sub(r"\s+", " ", bg).strip()
-
     if len(q) <= max_chars:
         if not bg:
             return q
@@ -284,7 +300,7 @@ def strict_truncate_query(base: str, suffix: str = "", max_len: int = 395) -> st
 
 
 def clamp01(p: float) -> float:
-    return max(0.0, min(1.0, p))
+    return float(max(MIN_P, min(MAX_P, p)))
 
 
 def sigmoid(x: float) -> float:
@@ -334,8 +350,8 @@ def stable_question_cache_key(question: MetaculusQuestion) -> str:
     qid = getattr(question, "id", None) or getattr(question, "question_id", None)
     if qid is not None:
         return str(qid)
-    payload = (question.question_text or "") + "||" + (question.background_info or "") + "||" + (
-        question.resolution_criteria or ""
+    payload = (question.question_text or " ") + "||" + (question.background_info or " ") + "||" + (
+        question.resolution_criteria or " "
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -351,7 +367,7 @@ def map_to_valid_options(pred: NormalizedPredictedOptionList, valid_options: Lis
         norm = canonicalize_option_name(opt.option_name)
         if norm in valid_norm:
             seen[valid_norm[norm]] = float(opt.probability)
-
+    
     # Ensure all options present; missing get 0.0 then normalize
     full_probs = [max(0.0, float(seen.get(o, 0.0))) for o in valid_options]
     s = sum(full_probs)
@@ -366,8 +382,16 @@ def map_to_valid_options(pred: NormalizedPredictedOptionList, valid_options: Lis
     )
 
 
+def _normalize_predicted_option(raw: dict) -> dict:
+    """Ensure option dict uses 'option_name' field for Pydantic compatibility."""
+    result = raw.copy()
+    if "option" in result and "option_name" not in result:
+        result["option_name"] = result.pop("option")
+    return result
+
+
 # =========================================================
-# 🧠 Archetype detection (rules first, LLM fallback)
+# 🧠 Archetype Detection (Rules First, LLM Fallback)
 # =========================================================
 def _question_text_blob(q: MetaculusQuestion) -> str:
     return " ".join([q.question_text or "", q.background_info or "", q.resolution_criteria or ""]).lower()
@@ -377,40 +401,32 @@ def rule_archetype(text: str) -> tuple[Optional[Archetype], float]:
     # MARKET
     if re.search(r"\b(stock|shares?|equity|ticker|nasdaq|nyse|s&p|dow|crypto|bitcoin|eth|price target|bond yield)\b", text):
         return Archetype.MARKET, 0.95
-
     # ELECTION/POLITICS
     if re.search(r"\b(election|polls?|parliament|senate|congress|president|prime minister|referendum|bill|law|legislation)\b", text):
         return Archetype.ELECTION, 0.85
-
     # MACRO
     if re.search(r"\b(cpi|inflation|gdp|unemployment|interest rate|fed|ecb|boj|boe|central bank|ppi)\b", text):
         return Archetype.MACRO, 0.85
-
     # GEO/CONFLICT
     if re.search(r"\b(war|invasion|ceasefire|missile|sanctions?|nato|military|conflict|hostages?|border clash)\b", text):
         return Archetype.GEO_CONFLICT, 0.80
-
     # WEATHER/NATURAL
     if re.search(r"\b(hurricane|typhoon|earthquake|volcano|wildfire|storm|flood|tornado)\b", text):
         return Archetype.WEATHER_NATURAL, 0.85
-
     # SPORTS/ENT
     if re.search(r"\b(championship|tournament|world cup|nba|nfl|mlb|nhl|ucl|olympics|oscars?|grammys?|bafta|emmys?)\b", text):
         return Archetype.SPORTS_ENT, 0.80
-
     # SCI/TECH
     if re.search(r"\b(benchmark|model|ai|paper|arxiv|launch|prototype|clinical trial|phase i|phase ii|phase iii|compute|chip)\b", text):
         return Archetype.SCI_TECH, 0.75
-
     # ORG/PRODUCT
     if re.search(r"\b(acquisition|merger|funding|series [a-z]|ipo|product|policy update|terms of service|reorg|layoffs?)\b", text):
         return Archetype.ORG_PRODUCT, 0.70
-
     return None, 0.0
 
 
 # =========================================================
-# 🎯 Reliability + Extremization (type-aware)
+# 🎯 Reliability + Extremization (Type-Aware)
 # =========================================================
 def estimate_reliability(
     question: MetaculusQuestion,
@@ -426,9 +442,9 @@ def estimate_reliability(
     src_lines = [ln for ln in lines if re.match(r"^\[(T|H|E)\d+\]\s", ln)]
     n = len(src_lines)
     e = min(1.0, n / 6.0)
-
+    
     # Resolution clarity
-    rc = (getattr(question, "resolution_criteria", "") or "").lower()
+    rc = (getattr(question, "resolution_criteria", " ") or " ").lower()
     vague_markers = ["ambiguous", "subjective", "at discretion", "may decide", "likely", "reasonable"]
     objective_markers = ["will resolve", "according to", "published", "official", "announced", "measured", "reported"]
     c = 0.55
@@ -457,7 +473,7 @@ def estimate_reliability(
         h = 0.45
 
     # Base-rate anchoring: look for explicit outside-view language
-    rt = (reasoning_text or "").lower()
+    rt = (reasoning_text or " ").lower()
     b = 0.25
     if "base rate" in rt or "reference class" in rt or "outside view" in rt:
         b = 0.85
@@ -480,8 +496,8 @@ def estimate_reliability(
     r = 0.28 * e + 0.20 * c + 0.15 * h + 0.22 * b + 0.15 * archetype_prior
 
     # Penalize handwaving: lots of words, few numbers
-    n_numbers = len(re.findall(r"\b\d+(\.\d+)?\b", reasoning_text or ""))
-    if len((reasoning_text or "")) > 350 and n_numbers < 4:
+    n_numbers = len(re.findall(r"\b\d+(\.\d+)?\b", reasoning_text or " "))
+    if len((reasoning_text or " ")) > 350 and n_numbers < 4:
         r -= 0.10
 
     if any(w in rt for w in ["mixed", "unclear", "contradict", "conflicting", "hard to say"]):
@@ -497,16 +513,16 @@ def estimate_reliability(
 def extremize_binary(p_raw: float, r: float, tuning: ArchetypeTuning) -> float:
     """
     Reliability-driven log-odds extremization. Archetype tuning sets max k.
+    Conservative but bold: only extremize when reliability is high.
     """
     p_raw = clamp01(p_raw)
     r = clamp01(r)
-
     if r < 0.35:
-        k = 0.85
+        k = 0.85  # De-extremize when unreliable
     elif r <= 0.65:
-        k = 1.0
+        k = 1.0   # No change
     else:
-        # scale to max_k
+        # Scale to max_k
         frac = (r - 0.65) / 0.35
         k = 1.0 + (tuning.max_k_binary - 1.0) * frac
 
@@ -520,7 +536,6 @@ def extremize_mc(probs: List[float], r: float, tuning: ArchetypeTuning) -> List[
     r = clamp01(r)
     if not probs:
         return probs
-
     if r < 0.35:
         k = 0.90
     elif r <= 0.65:
@@ -549,7 +564,6 @@ def adjust_percentiles_spread(pcts: List[Percentile], r: float, archetype: Arche
     """
     if not pcts:
         return pcts
-
     r = clamp01(r)
     # Archetype modifiers: market/macro distributions can be sharper; geo/other should be wider.
     arche_mult = {
@@ -585,10 +599,11 @@ def adjust_percentiles_spread(pcts: List[Percentile], r: float, archetype: Arche
 
 
 # =========================================================
-# 🤖 UpskillBot (type-aware, conservative but bold)
+# 🤖 UpskillBot (Type-Aware, Conservative but Bold)
 # =========================================================
 class UpskillBot(ForecastBot):
-    _max_concurrent_questions = 1
+    _max_concurrent_questions = MAX_CONCURRENT_QUESTIONS
+    _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -603,9 +618,6 @@ class UpskillBot(ForecastBot):
         self._prediction_records: List[Dict[str, Any]] = []
         self._research_cache: Dict[str, str] = {}
 
-        # instance-level limiter
-        self._concurrency_limiter = asyncio.Semaphore(self._max_concurrent_questions)
-
         # Archetype caches (avoid repeated classification cost)
         self._archetype_cache: Dict[str, Archetype] = {}
 
@@ -614,6 +626,8 @@ class UpskillBot(ForecastBot):
         self._model_pricing = {
             "gpt-4.1-mini": {"input": 0.15, "output": 0.60},
             "claude-sonnet-4.5": {"input": 3.00, "output": 15.00},
+            "gpt-5.2": {"input": 2.50, "output": 10.00},
+            "gpt-5.1": {"input": 2.00, "output": 8.00},
         }
         self._encoding_cache: Dict[str, Any] = {}
 
@@ -677,46 +691,41 @@ class UpskillBot(ForecastBot):
             return guess
 
         # LLM fallback via parser model (cheap)
-        prompt = clean_indents(
-            f"""
-            Classify this forecasting question into exactly one archetype:
-            - market
-            - election_politics
-            - sci_tech
-            - macro
-            - geo_conflict
-            - org_product
-            - weather_natural
-            - sports_entertainment
-            - other
+        prompt = clean_indents(f"""
+        Classify this forecasting question into exactly one archetype:
+        - market
+        - election_politics
+        - sci_tech
+        - macro
+        - geo_conflict
+        - org_product
+        - weather_natural
+        - sports_entertainment
+        - other
 
-            Return ONLY the archetype string.
+        Return ONLY the archetype string.
 
-            QUESTION:
-            {question.question_text}
+        QUESTION:
+        {question.question_text}
 
-            BACKGROUND:
-            {question.background_info or "None"}
+        BACKGROUND:
+        {question.background_info or "None"}
 
-            RESOLUTION:
-            {question.resolution_criteria or "None"}
-            """
-        )
+        RESOLUTION:
+        {question.resolution_criteria or "None"}
+        """)
         out = (await self._invoke("parser", prompt)).strip().lower()
         mapping = {a.value: a for a in Archetype}
         a = mapping.get(out, Archetype.OTHER)
         self._archetype_cache[key] = a
         return a
 
-    # -------------------------------
-    # FIX: provide default archetype arg
-    # so ForecastBot callers that call
-    # run_research(question) won't crash
-    # -------------------------------
-    async def run_research(self, question: MetaculusQuestion, archetype: Optional[Archetype] = None) -> str:
-        if archetype is None:
-            archetype = await self.detect_archetype(question)
-
+    async def run_research(self, question: MetaculusQuestion) -> str:
+        """
+        Compatible with ForecastBot base class signature.
+        Detects archetype internally.
+        """
+        archetype = await self.detect_archetype(question)
         cache_key = f"{stable_question_cache_key(question)}::{archetype.value}"
         if cache_key in self._research_cache:
             return self._research_cache[cache_key]
@@ -735,9 +744,9 @@ class UpskillBot(ForecastBot):
                 )
                 recent_snips = []
                 for i, r in enumerate((recent.get("results", []) or [])[:4]):
-                    title = r.get("title", "") or ""
-                    url = r.get("url", "") or ""
-                    content = r.get("content") or ""
+                    title = r.get("title", " ") or " "
+                    url = r.get("url", " ") or " "
+                    content = r.get("content") or " "
                     snippet = textwrap.shorten(content, width=160, placeholder="…")
                     recent_snips.append(f"[T{i+1}] {title} ({url}): {snippet}")
                 recent_summary = "\n".join(recent_snips) if recent_snips else "[T] No recent results"
@@ -753,9 +762,9 @@ class UpskillBot(ForecastBot):
                 )
                 hist_snips = []
                 for i, r in enumerate((historical.get("results", []) or [])[:4]):
-                    title = r.get("title", "") or ""
-                    url = r.get("url", "") or ""
-                    content = r.get("content") or ""
+                    title = r.get("title", " ") or " "
+                    url = r.get("url", " ") or " "
+                    content = r.get("content") or " "
                     snippet = textwrap.shorten(content, width=160, placeholder="…")
                     hist_snips.append(f"[H{i+1}] {title} ({url}): {snippet}")
                 historical_summary = "\n".join(hist_snips) if hist_snips else "[H] No historical results"
@@ -770,9 +779,9 @@ class UpskillBot(ForecastBot):
                 if exa_results:
                     exa_snips = []
                     for i, r in enumerate(exa_results[:4]):
-                        title = r.get("title", "") or ""
-                        url = r.get("url", "") or ""
-                        text = r.get("text") or r.get("snippet") or ""
+                        title = r.get("title", " ") or " "
+                        url = r.get("url", " ") or " "
+                        text = r.get("text") or r.get("snippet") or " "
                         snippet = textwrap.shorten(text, width=160, placeholder="…")
                         exa_snips.append(f"[E{i+1}] {title} ({url}): {snippet}")
                     exa_summary = "\n".join(exa_snips)
@@ -782,16 +791,14 @@ class UpskillBot(ForecastBot):
                 logger.error(f"Exa search failed: {e}")
                 exa_summary = f"[E] Error: {e}"
 
-            research = clean_indents(
-                f"""
-                ### Research (as of {today_str}) — Archetype: {archetype.value}
-                {recent_summary}
+            research = clean_indents(f"""
+            ### Research (as of {today_str}) — Archetype: {archetype.value}
+            {recent_summary}
 
-                {historical_summary}
+            {historical_summary}
 
-                {exa_summary}
-                """
-            ).strip()
+            {exa_summary}
+            """).strip()
 
             self._research_cache[cache_key] = research
             return research
@@ -810,12 +817,12 @@ class UpskillBot(ForecastBot):
             record: Dict[str, Any] = {
                 "question_id": qid,
                 "page_url": getattr(question, "page_url", "N/A"),
-                "title": (getattr(question, "question_text", "Unknown") or "")[:120],
+                "title": (getattr(question, "question_text", "Unknown") or " ")[:120],
                 "type": question.__class__.__name__,
                 "predicted_prob": prob,
                 "predicted_at": datetime.now(timezone.utc).isoformat(),
                 "difficulty_score": self._estimate_question_difficulty(question),
-                "reasoning_snippet": shorten_reasoning(reasoning, 400).replace("\n", " "),
+                "reasoning_snippet": shorten_reasoning(reasoning, 400).replace("\n", "  "),
             }
             if extra:
                 for k, v in extra.items():
@@ -831,14 +838,14 @@ class UpskillBot(ForecastBot):
             logger.debug(f"Non-fatal: prediction record skipped ({e})")
 
     def _estimate_question_difficulty(self, question: MetaculusQuestion) -> float:
-        text = ((question.question_text or "") + " " + (question.background_info or "")).lower()
+        text = ((question.question_text or " ") + "  " + (question.background_info or " ")).lower()
         now = datetime.now(timezone.utc)
         days_to_close = (
             (question.close_time - now).total_seconds() / 86400 if getattr(question, "close_time", None) else 365
         )
         base_rate_hint = any(w in text for w in ["rare", "unlikely", "first time", "never before", "unprecedented"])
         long_horizon = days_to_close > 365
-        vague_resolution = "ambiguous" in (question.resolution_criteria or "").lower()
+        vague_resolution = "ambiguous" in (question.resolution_criteria or " ").lower()
         return min(1.0, 0.3 + 0.3 * long_horizon + 0.2 * base_rate_hint + 0.2 * vague_resolution)
 
     def _archetype_prompt_header(self, archetype: Archetype) -> str:
@@ -868,90 +875,84 @@ class UpskillBot(ForecastBot):
         header = self._archetype_prompt_header(archetype)
         tuning = archetype_tuning(archetype)
 
-        initial_prompt = clean_indents(
-            f"""
-            You are a calibrated superforecaster. Today (UTC): {today}.
-            ARCHETYPE: {archetype.value}. Guidance: {header}
+        initial_prompt = clean_indents(f"""
+        You are a calibrated superforecaster. Today (UTC): {today}.
+        ARCHETYPE: {archetype.value}. Guidance: {header}
 
-            PROCESS (conservative, but not timid):
-            - Start with outside view: explicitly state reference class + base rate (or range).
-            - Then inside view: list key evidence with direction (+/–) and strength (1–5).
-            - Update from base rate to a "raw" probability.
-            - Be willing to go bold ONLY if evidence is strong and resolution is clear.
+        PROCESS (conservative, but not timid):
+        - Start with outside view: explicitly state reference class + base rate (or range).
+        - Then inside view: list key evidence with direction (+/–) and strength (1–5).
+        - Update from base rate to a "raw" probability.
+        - Be willing to go bold ONLY if evidence is strong and resolution is clear.
 
-            WRITING:
-            - Keep explanation short: 6–10 bullets total.
-            - Include 2–3 signposts with conditional updates ("If X, move to ~Y%").
+        WRITING:
+        - Keep explanation short: 6–10 bullets total.
+        - Include 2–3 signposts with conditional updates ("If X, move to ~Y%").
 
-            FORMAT (must end with EXACT line "Probability: ZZ%"):
-            Approach: <1 sentence>
-            Base rate: <1 line, include a % or range>
-            Evidence:
-            - <bullet (≤1 line)>
-            ...
-            Signposts:
-            - If <event>, update to ~<p>%
-            - If <event>, update to ~<p>%
-            Uncertainties:
-            - <2 bullets>
-            Final: <1 sentence>
-            Probability: ZZ%
+        FORMAT (must end with EXACT line "Probability: ZZ%"):
+        Approach: <1 sentence>
+        Base rate: <1 line, include a % or range>
+        Evidence:
+        - <bullet (≤1 line)>
+        ...
+        Signposts:
+        - If <event>, update to ~<p>%
+        - If <event>, update to ~<p>%
+        Uncertainties:
+        - <2 bullets>
+        Final: <1 sentence>
+        Probability: ZZ%
 
-            QUESTION:
-            {question.question_text}
+        QUESTION:
+        {question.question_text}
 
-            BACKGROUND:
-            {question.background_info or 'None'}
+        BACKGROUND:
+        {question.background_info or 'None'}
 
-            RESOLUTION CRITERIA:
-            {question.resolution_criteria or 'None'}
+        RESOLUTION CRITERIA:
+        {question.resolution_criteria or 'None'}
 
-            RESEARCH:
-            {research}
-            """
-        )
+        RESEARCH:
+        {research}
+        """)
         initial_text = await self._invoke("default", initial_prompt)
 
-        red_team_prompt = clean_indents(
-            f"""
-            You are a skeptical reviewer for archetype={archetype.value}.
-            Push back against overconfidence and weak reference classes.
+        red_team_prompt = clean_indents(f"""
+        You are a skeptical reviewer for archetype={archetype.value}.
+        Push back against overconfidence and weak reference classes.
 
-            Provide:
-            - 3 strongest counterarguments (bullets)
-            - 2 resolution traps / ambiguity checks (bullets)
-            - 2 signposts that would move probability substantially (bullets)
-            - Calibration note: should we be closer to base rate / 50%?
+        Provide:
+        - 3 strongest counterarguments (bullets)
+        - 2 resolution traps / ambiguity checks (bullets)
+        - 2 signposts that would move probability substantially (bullets)
+        - Calibration note: should we be closer to base rate / 50%?
 
-            FORECAST:
-            {initial_text}
+        FORECAST:
+        {initial_text}
 
-            QUESTION:
-            {question.question_text}
+        QUESTION:
+        {question.question_text}
 
-            RESEARCH:
-            {research}
-            """
-        )
+        RESEARCH:
+        {research}
+        """)
         critique = await self._invoke("default", red_team_prompt)
 
-        final_prompt = clean_indents(
-            f"""
-            Revise the forecast using the critique. Keep archetype guidance in mind.
-            Rules:
-            - Keep outside view explicit (reference class + base rate).
-            - Make the smallest necessary adjustment.
-            - If critique reveals weak evidence or resolution ambiguity, move toward base rate/50%.
-            - If critique is answered with strong evidence, you MAY go bolder.
-            - Keep same format and end with: Probability: ZZ%
+        final_prompt = clean_indents(f"""
+        Revise the forecast using the critique. Keep archetype guidance in mind.
+        Rules:
+        - Keep outside view explicit (reference class + base rate).
+        - Make the smallest necessary adjustment.
+        - If critique reveals weak evidence or resolution ambiguity, move toward base rate/50%.
+        - If critique is answered with strong evidence, you MAY go bolder.
+        - Keep same format and end with: Probability: ZZ%
 
-            ORIGINAL:
-            {initial_text}
+        ORIGINAL:
+        {initial_text}
 
-            CRITIQUE:
-            {critique}
-            """
-        )
+        CRITIQUE:
+        {critique}
+        """)
         revised_text = await self._invoke("default", final_prompt)
 
         # Parse raw probability
@@ -985,67 +986,81 @@ class UpskillBot(ForecastBot):
         return shorten_reasoning(revised_text, 900), p_final, r
 
     async def _run_forecast_on_binary(
-        self, question: BinaryQuestion, research: str, archetype: Archetype
+        self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
+        archetype = await self.detect_archetype(question)
         reasoning, prob, r = await self._run_forecast_with_red_team(question, research, archetype)
+        
+        # Build detailed reasoning with extremization audit trail
+        tuning = archetype_tuning(archetype)
+        detailed_reasoning = self._build_detailed_reasoning(
+            question=question,
+            reasoning=reasoning,
+            archetype=archetype,
+            reliability=r,
+            prediction=prob,
+            prediction_type="binary",
+            tuning=tuning,
+        )
+        
         self._record_prediction(
             question,
             prob,
-            reasoning,
+            detailed_reasoning,
             extra={"archetype": archetype.value, "reliability_r": round(float(r), 4)},
         )
-        return ReasonedPrediction(prediction_value=prob, reasoning=reasoning)
+        self._log_calibration(question, prob, detailed_reasoning, archetype, r)
+        return ReasonedPrediction(prediction_value=prob, reasoning=detailed_reasoning)
 
     async def _run_forecast_on_multiple_choice(
-        self, question: MultipleChoiceQuestion, research: str, archetype: Archetype
+        self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[NormalizedPredictedOptionList]:
+        archetype = await self.detect_archetype(question)
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         header = self._archetype_prompt_header(archetype)
         tuning = archetype_tuning(archetype)
 
-        prompt = clean_indents(
-            f"""
-            You are a calibrated superforecaster. Today (UTC): {today}.
-            ARCHETYPE: {archetype.value}. Guidance: {header}
+        prompt = clean_indents(f"""
+        You are a calibrated superforecaster. Today (UTC): {today}.
+        ARCHETYPE: {archetype.value}. Guidance: {header}
 
-            PROCESS:
-            - Start with outside view/reference class.
-            - Then inside view: key evidence, short bullets.
-            - Produce a "raw" probability allocation.
-            - Be willing to concentrate probability ONLY if evidence is strong and resolution is clear.
+        PROCESS:
+        - Start with outside view/reference class.
+        - Then inside view: key evidence, short bullets.
+        - Produce a "raw" probability allocation.
+        - Be willing to concentrate probability ONLY if evidence is strong and resolution is clear.
 
-            REQUIREMENTS:
-            - Probabilities must be decimals in [0,1] and sum to 1.
-            - Use option text EXACTLY as provided.
-            - Keep reasoning ≤ 8 bullets.
-            - Include 2 signposts.
+        REQUIREMENTS:
+        - Probabilities must be decimals in [0,1] and sum to 1.
+        - Use option_name field with EXACT option text as provided.
+        - Keep reasoning ≤ 8 bullets.
+        - Include 2 signposts.
 
-            QUESTION:
-            {question.question_text}
+        QUESTION:
+        {question.question_text}
 
-            BACKGROUND:
-            {question.background_info or 'None'}
+        BACKGROUND:
+        {question.background_info or 'None'}
 
-            RESOLUTION CRITERIA:
-            {question.resolution_criteria or 'None'}
+        RESOLUTION CRITERIA:
+        {question.resolution_criteria or 'None'}
 
-            OPTIONS:
-            {question.options}
+        OPTIONS:
+        {question.options}
 
-            RESEARCH:
-            {research}
+        RESEARCH:
+        {research}
 
-            OUTPUT:
-            Approach: <1 sentence>
-            Base rate: <1 line (if applicable)>
-            Evidence: <≤8 bullets>
-            Signposts:
-            - If <event>, reallocate toward <option>
-            - If <event>, reallocate toward <option>
-            Then list options as:
-            <Option text>: 0.23
-            """
-        )
+        OUTPUT:
+        Approach: <1 sentence>
+        Base rate: <1 line (if applicable)>
+        Evidence: <≤8 bullets>
+        Signposts:
+        - If <event>, reallocate toward <option>
+        - If <event>, reallocate toward <option>
+        Then list options as:
+        <Option text>: 0.23
+        """)
         reasoning = await self._invoke("default", prompt)
 
         try:
@@ -1056,9 +1071,12 @@ class UpskillBot(ForecastBot):
                 additional_instructions=(
                     f"Options: {question.options}. "
                     "Probabilities must be decimals (0-1) summing to 1. "
-                    "Option names must match EXACTLY."
+                    "Use 'option_name' field with EXACT option text. "
                 ),
             )
+            # Normalize any stray field names for robustness
+            normalized_options = [_normalize_predicted_option(o) if isinstance(o, dict) else o for o in pred.predicted_options]
+            pred = NormalizedPredictedOptionList(predicted_options=normalized_options)
         except Exception as e:
             logger.warning(f"MC parse failed Q{getattr(question, 'id', 'unknown')}: {e}")
             p = 1.0 / max(1, len(question.options))
@@ -1083,80 +1101,90 @@ class UpskillBot(ForecastBot):
         top_opt = max(prob_dict, key=prob_dict.get) if prob_dict else "N/A"
         top_prob = float(prob_dict[top_opt]) if prob_dict else None
 
-        reasoning_short = shorten_reasoning(reasoning, 900)
+        # Build detailed reasoning with extremization audit trail
+        detailed_reasoning = self._build_detailed_reasoning(
+            question=question,
+            reasoning=shorten_reasoning(reasoning, 900),
+            archetype=archetype,
+            reliability=r,
+            prediction=prob_dict,
+            prediction_type="multiple_choice",
+            tuning=tuning,
+        )
+
         self._record_prediction(
             question,
             top_prob,
-            reasoning_short,
+            detailed_reasoning,
             extra={"archetype": archetype.value, "top_option": top_opt, "reliability_r": round(float(r), 4)},
         )
-        return ReasonedPrediction(prediction_value=pred2, reasoning=reasoning_short)
+        self._log_calibration(question, prob_dict, detailed_reasoning, archetype, r)
+        return ReasonedPrediction(prediction_value=pred2, reasoning=detailed_reasoning)
 
     async def _run_forecast_on_numeric(
-        self, question: NumericQuestion, research: str, archetype: Archetype
+        self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
+        archetype = await self.detect_archetype(question)
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         header = self._archetype_prompt_header(archetype)
 
         lower_msg = (
-            f"Lower bound: {question.lower_bound}." if question.lower_bound is not None else "No explicit lower bound."
+            f"Lower bound: {question.lower_bound}. " if question.lower_bound is not None else "No explicit lower bound. "
         )
         upper_msg = (
-            f"Upper bound: {question.upper_bound}." if question.upper_bound is not None else "No explicit upper bound."
+            f"Upper bound: {question.upper_bound}. " if question.upper_bound is not None else "No explicit upper bound. "
         )
 
-        prompt = clean_indents(
-            f"""
-            You are a calibrated quantitative forecaster. Today (UTC): {today}.
-            ARCHETYPE: {archetype.value}. Guidance: {header}
+        prompt = clean_indents(f"""
+        You are a calibrated quantitative forecaster. Today (UTC): {today}.
+        ARCHETYPE: {archetype.value}. Guidance: {header}
 
-            PROCESS:
-            - Start with outside view/reference class.
-            - Then inside view: key evidence, short bullets.
-            - Produce a distribution: widen tails if uncertain; tighten if reliable (but don't be unrealistically tight).
+        PROCESS:
+        - Start with outside view/reference class.
+        - Then inside view: key evidence, short bullets.
+        - Produce a distribution: widen tails if uncertain; tighten if reliable (but don't be unrealistically tight).
 
-            REQUIREMENTS:
-            - Respect bounds if given.
-            - Keep reasoning ≤ 8 bullets.
-            - Output MUST include a parsable percentile list.
-            - Return VALID JSON only for the percentile list (no markdown).
+        REQUIREMENTS:
+        - Respect bounds if given.
+        - Keep reasoning ≤ 8 bullets.
+        - Output MUST include a parsable percentile list.
+        - Return VALID JSON only for the percentile list (no markdown).
 
-            QUESTION:
-            {question.question_text}
+        QUESTION:
+        {question.question_text}
 
-            BACKGROUND:
-            {question.background_info or 'None'}
+        BACKGROUND:
+        {question.background_info or 'None'}
 
-            RESOLUTION CRITERIA:
-            {question.resolution_criteria or 'None'}
+        RESOLUTION CRITERIA:
+        {question.resolution_criteria or 'None'}
 
-            BOUNDS:
-            {lower_msg} {upper_msg}
+        BOUNDS:
+        {lower_msg} {upper_msg}
 
-            UNITS:
-            {question.unit_of_measure or "Unknown"}
+        UNITS:
+        {question.unit_of_measure or "Unknown"}
 
-            RESEARCH:
-            {research}
+        RESEARCH:
+        {research}
 
-            OUTPUT:
-            Approach: <1 sentence>
-            Base rate: <1 line (if possible)>
-            Evidence: <≤8 bullets>
-            Signposts:
-            - If <event>, shift median to ~<value>
-            - If <event>, widen/narrow tails
-            PercentilesJSON:
-            [
-              {{"percentile":0.1,"value":123}},
-              {{"percentile":0.2,"value":...}},
-              {{"percentile":0.4,"value":...}},
-              {{"percentile":0.6,"value":...}},
-              {{"percentile":0.8,"value":...}},
-              {{"percentile":0.9,"value":...}}
-            ]
-            """
-        )
+        OUTPUT:
+        Approach: <1 sentence>
+        Base rate: <1 line (if possible)>
+        Evidence: <≤8 bullets>
+        Signposts:
+        - If <event>, shift median to ~<value>
+        - If <event>, widen/narrow tails
+        PercentilesJSON:
+        [
+          {{"percentile":0.1,"value":123}},
+          {{"percentile":0.2,"value":...}},
+          {{"percentile":0.4,"value":...}},
+          {{"percentile":0.6,"value":...}},
+          {{"percentile":0.8,"value":...}},
+          {{"percentile":0.9,"value":...}}
+        ]
+        """)
         reasoning = await self._invoke("default", prompt)
 
         r = estimate_reliability(question, research, reasoning, archetype)
@@ -1176,29 +1204,136 @@ class UpskillBot(ForecastBot):
             fallback = adjust_percentiles_spread(fallback, r, archetype)
             dist = NumericDistribution.from_question(fallback, question)
 
-        reasoning_short = shorten_reasoning(reasoning, 900)
+        # Build detailed reasoning with extremization audit trail
+        tuning = archetype_tuning(archetype)
+        detailed_reasoning = self._build_detailed_reasoning(
+            question=question,
+            reasoning=shorten_reasoning(reasoning, 900),
+            archetype=archetype,
+            reliability=r,
+            prediction=[{"percentile": p.percentile, "value": p.value} for p in pct_list] if 'pct_list' in locals() else "fallback",
+            prediction_type="numeric",
+            tuning=tuning,
+        )
+
         self._record_prediction(
             question,
             None,
-            reasoning_short,
+            detailed_reasoning,
             extra={"archetype": archetype.value, "reliability_r": round(float(r), 4)},
         )
-        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning_short)
+        self._log_calibration(question, dist, detailed_reasoning, archetype, r)
+        return ReasonedPrediction(prediction_value=dist, reasoning=detailed_reasoning)
 
-    async def _make_prediction(self, question: MetaculusQuestion, research: str):
+    def _build_detailed_reasoning(
+        self,
+        question: MetaculusQuestion,
+        reasoning: str,
+        archetype: Archetype,
+        reliability: float,
+        prediction: Any,
+        prediction_type: str,
+        tuning: ArchetypeTuning,
+    ) -> str:
         """
-        Override: detect archetype and use archetype-specific research.
+        Build detailed, auditable reasoning with extremization audit trail.
+        Matches Tude's multi-section format while preserving UpskillBot's archetype system.
         """
-        archetype = await self.detect_archetype(question)
-        research2 = await self.run_research(question, archetype)
+        qid = getattr(question, "id", "unknown")
+        qtxt = getattr(question, "question_text", "")[:200]
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        if isinstance(question, BinaryQuestion):
-            return await self._run_forecast_on_binary(question, research2, archetype)
-        if isinstance(question, MultipleChoiceQuestion):
-            return await self._run_forecast_on_multiple_choice(question, research2, archetype)
-        if isinstance(question, NumericQuestion):
-            return await self._run_forecast_on_numeric(question, research2, archetype)
-        raise ValueError(f"Unsupported: {type(question)}")
+        # Determine extremization details
+        if reliability < 0.35:
+            extremize_status = "De-extremized (low reliability)"
+            extremize_reason = f"r={reliability:.2f} < 0.35 → k=0.85 (conservative)"
+        elif reliability <= 0.65:
+            extremize_status = "No extremization"
+            extremize_reason = f"r={reliability:.2f} in [0.35, 0.65] → k=1.0 (neutral)"
+        else:
+            if prediction_type == "binary":
+                k = 1.0 + (tuning.max_k_binary - 1.0) * ((reliability - 0.65) / 0.35)
+            else:
+                k = 1.0 + (tuning.max_k_mc - 1.0) * ((reliability - 0.65) / 0.35)
+            extremize_status = f"Extremized (k={k:.2f})"
+            extremize_reason = f"r={reliability:.2f} > 0.65 → bold update justified"
+
+        # Format prediction value
+        if prediction_type == "binary":
+            pred_str = f"{prediction*100:.1f}%"
+        elif prediction_type == "multiple_choice":
+            top_opt = max(prediction, key=prediction.get) if isinstance(prediction, dict) else "N/A"
+            top_prob = prediction.get(top_opt, 0) if isinstance(prediction, dict) else 0
+            pred_str = f"{top_opt}: {top_prob*100:.1f}%"
+        else:
+            pred_str = "Distribution (see percentiles)"
+
+        return clean_indents(f"""
+        ## Forecast (Q{qid})
+        **Date (UTC):** {today}
+        **Archetype:** {archetype.value}
+        **Question:** {qtxt}
+
+        **Prediction:** {pred_str}
+
+        ### 🔍 Evidence Synthesis
+        {reasoning}
+
+        ### 📊 Reliability Assessment
+        - **Evidence strength:** {reliability:.2f}/1.00
+        - **Extremization:** {extremize_status}
+        - **Reason:** {extremize_reason}
+        - **Archetype bounds:** [{tuning.clip_lo:.3f}, {tuning.clip_hi:.3f}]
+
+        ### 🎯 Why This Prediction
+        - **Archetype guidance:** {self._archetype_prompt_header(archetype)}
+        - **Base rate:** Outside view applied per {archetype.value} reference class
+        - **Inside view:** Evidence-weighted update from research (Tavily + Exa)
+        - **Conservative-but-bold:** De-extremize when r<0.35, extremize when r>0.65
+
+        ### ⚠️ Key Signposts
+        - Watch for archetype-specific catalysts (see Evidence section)
+        - Resolution criteria clarity: {'High' if reliability > 0.6 else 'Medium' if reliability > 0.35 else 'Low'}
+        - Model confidence: {'High' if reliability > 0.65 else 'Medium' if reliability > 0.35 else 'Low'}
+
+        ### 📈 Extremization Audit Trail
+        - Raw probability: Model output (see Evidence)
+        - Reliability score: {reliability:.4f}
+        - Extremization factor k: {extremize_status.split('(')[-1].rstrip(')') if '(' in extremize_status else 'N/A'}
+        - Final probability: {pred_str}
+        - Clipping applied: [{tuning.clip_lo:.3f}, {tuning.clip_hi:.3f}]
+        """).strip()
+
+    def _log_calibration(
+        self,
+        question: MetaculusQuestion,
+        prediction_value: Any,
+        reasoning: str,
+        archetype: Archetype,
+        reliability: float,
+    ):
+        """Log forecast to JSONL for post-hoc calibration analysis (matches Tude's format)."""
+        qid = getattr(question, "id", "unknown")
+        log_entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "question_id": qid,
+            "question_type": question.__class__.__name__,
+            "question_text": getattr(question, "question_text", "")[:500],
+            "resolution_date": getattr(question, "resolution_date", None),
+            "community_prediction": getattr(question, "community_prediction", None),
+            "prediction_value": prediction_value,
+            "archetype": archetype.value,
+            "reliability_score": round(reliability, 4),
+            "models_used": [DEFAULT_FORECASTER, PARSER_MODEL],
+            "research_used": True,
+            "searchers_used": ["tavily", "exa"] if os.getenv("EXA_API_KEY") else ["tavily"],
+            "reasoning_snippet": reasoning[:1500],
+        }
+        try:
+            with open(CALIBRATION_LOG_FILE, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to log calibration  {e}")
 
     async def _compute_brier_scores(self):
         try:
@@ -1249,7 +1384,7 @@ class UpskillBot(ForecastBot):
         except Exception as e:
             logger.error(f"Brier/log score computation failed: {e}")
 
-    def export_predictions_to_csv(self, filepath: str = "upskill_bot_forecasts.csv"):
+    def export_predictions_to_csv(self, filepath: str = PREDICTIONS_CSV_FILE):
         if not self._prediction_records:
             return
         safe_records = []
@@ -1268,7 +1403,7 @@ class UpskillBot(ForecastBot):
         df.to_csv(filepath, index=False)
         logger.info(f"✅ Exported {len(df)} predictions to {filepath}")
 
-    def export_cost_report(self, filepath: str = "upskill_bot_costs.csv"):
+    def export_cost_report(self, filepath: str = COSTS_CSV_FILE):
         if not self._cost_tracker:
             return
         records = []
@@ -1292,18 +1427,42 @@ class UpskillBot(ForecastBot):
         logger.info(f"✅ Exported cost report to {filepath}")
         logger.info(f"💰 Total estimated cost: ${total_cost:.4f}")
 
-    async def run_all_tournaments(self, tournament_ids: List):
-        for tid in tournament_ids:
-            logger.info(f"▶ Forecasting tournament: {tid}")
-            await self.forecast_on_tournament(tid, return_exceptions=True)
-        await self._compute_brier_scores()
-        self.export_predictions_to_csv()
-        self.export_cost_report()
+    def log_report_summary(self, reports: List[Any]):
+        """Match Tude's report summary format."""
+        successful = sum(1 for r in reports if not isinstance(r, Exception))
+        failed = len(reports) - successful
+        logger.info(f"----------------------------------------------------------------------------------------------------")
+        logger.info(f"Bot: UpskillBot")
+        if failed > 0:
+            logger.info(f"❌ Exceptions: {failed}/{len(reports)} questions failed")
+        logger.info(f"✅ Successful forecasts: {successful}/{len(reports)}")
+        logger.info(f"📊 Calibration logs: {CALIBRATION_LOG_FILE}")
+        logger.info(f"📊 Predictions CSV: {PREDICTIONS_CSV_FILE}")
+        logger.info(f"💰 Cost report: {COSTS_CSV_FILE}")
+        logger.info(f"----------------------------------------------------------------------------------------------------")
 
 
+# =========================================================
+# 🚀 Main Entry Point
+# =========================================================
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run UpskillBot.")
+    parser.add_argument("--tournament-ids", nargs="+", type=str, default=None)
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+
+    client = MetaculusClient()
+    default_ids = list(dict.fromkeys([
+        "32916",
+        "minibench",
+        "market-pulse-26q1",
+        getattr(client, "CURRENT_MINIBENCH_ID", "minibench"),
+    ]))
+    tournament_ids = args.tournament_ids or default_ids
 
     bot = UpskillBot(
         research_reports_per_question=1,
@@ -1317,7 +1476,32 @@ if __name__ == "__main__":
         },
     )
 
-    tournament_ids = [32916, "minibench", "market-pulse-26q1"]
-    logger.info("🚀 Starting UpskillBot (type-aware archetypes + calibrated extremization)...")
-    asyncio.run(bot.run_all_tournaments(tournament_ids))
-    logger.info("🏁 UpskillBot run completed.")
+    try:
+        all_reports = []
+        for tid in tournament_ids:
+            logger.info(f"▶ Forecasting tournament: {tid}")
+
+            for attempt in range(RETRY_MAX):
+                try:
+                    reports = asyncio.run(bot.forecast_on_tournament(tid, return_exceptions=True))
+                    all_reports.extend(reports)
+                    break
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "too many requests" in msg or "cloudflare" in msg or "1015" in msg or "429" in msg:
+                        logger.error(f"Rate-limited on tournament {tid} (attempt {attempt+1}/{RETRY_MAX}): {e}")
+                        base = min(RETRY_MAX_S, RETRY_BASE_S * (2 ** attempt))
+                        jitter = random.uniform(0.0, base * 0.25)
+                        time.sleep(base + jitter)
+                        continue
+                    raise
+
+            time.sleep(float(os.getenv("TOURNAMENT_SLEEP_S", "8.0")))
+
+        bot.log_report_summary(all_reports)
+        asyncio.run(bot._compute_brier_scores())
+        bot.export_predictions_to_csv()
+        bot.export_cost_report()
+        logger.info(f"🏁 UpskillBot run completed. Calibration logs saved to {CALIBRATION_LOG_FILE}")
+    except Exception as e:
+        logger.error(f"Critical error: {e}", exc_info=True)
