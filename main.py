@@ -1,36 +1,3 @@
-"""
-upskillbot.py
-=============
-UpskillBot – an open-source superforecaster bot inspired by the finding that
-disciplined forecasters using public information can outperform domain experts.
-
-Architecture
-------------
-  Primary reasoning  : Claude Opus 4.6    (OpenRouter) – deep analysis
-  Summarization      : Claude Sonnet 4.6  (OpenRouter) – efficient summaries
-  Query planning     : GPT-5.4            (OpenRouter) – structured output
-
-Research Sources (multi-API)
------------------------------
-  1. Exa       – neural semantic search (EXA_API_KEY)
-  2. Tavily    – web search with raw content (TAVILY_API_KEY)
-  3. AskNews   – real-time news search (ASKNEWS_CLIENT_ID + ASKNEWS_CLIENT_SECRET)
-
-New capabilities (vs. teserlinks)
-----------------------------------
-  1. QuestionAnalyser      – detects domain (geopolitics, economics, science…)
-                             and geography so research strategy adapts per question.
-  2. ModellingStrategy     – chooses the right forecasting frame per question
-                             (base-rate / trend / analogical / market-signal-led).
-  3. PluggableSourceRegistry – register any number of custom search/data sources.
-  4. ForecastValidator     – tracks predictions, computes confidence scores,
-                             flags low-confidence forecasts, persists ledger to SQLite.
-  5. ClientSpecialisation  – dataclass injected at construction time; sets domain
-                             focus, trusted source lists, and calibration targets.
-  6. ResearchCache         – persistent SQLite cache.
-  7. Extremization         – aggressive logit-space extremization (factor=1.65).
-  8. Conservativeness gate – hard-clips outlier probabilities before publish.
-"""
 
 import argparse
 import asyncio
@@ -80,15 +47,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _CLAUDE_OPUS_MODEL   = "openrouter/anthropic/claude-opus-4-6"
 _CLAUDE_SONNET_MODEL = "openrouter/anthropic/claude-sonnet-4-6"
-_GPT_MODEL           = "openrouter/openai/gpt-5.4"
-
-
-# ===========================================================================
-# 1. QUESTION ANALYSER  (was: QuestionClassifier / Decomposer)
-#    Detects domain and geography from question text so downstream components
-#    can adapt their strategy without hard-coded rules.
-# ===========================================================================
-
+_GPT_MODEL           = "openrouter/openai/gpt-5.4 mini"
 DOMAINS = [
     "geopolitics", "economics", "technology", "science",
     "public_health", "environment", "sports", "finance", "social", "other",
@@ -746,9 +705,6 @@ class UpskillBot(ForecastBot):
     """
     UpskillBot – superforecaster bot with multi-API research (Exa, Tavily, AskNews),
     aggressive extremization, and a conservativeness gate before publishing.
-
-    Inspired by the research finding that structured forecasters using open-source
-    information outperform trained domain experts.
     """
 
     _max_concurrent_questions = 3
