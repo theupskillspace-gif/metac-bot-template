@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _CLAUDE_OPUS_MODEL   = "openrouter/anthropic/claude-opus-4-6"
 _CLAUDE_SONNET_MODEL = "openrouter/anthropic/claude-sonnet-4-6"
-_GPT_MODEL           = "openrouter/openai/gpt-5.4 mini"
+_GPT_MODEL           = "openrouter/openai/gpt-5.4-mini"
 DOMAINS = [
     "geopolitics", "economics", "technology", "science",
     "public_health", "environment", "sports", "finance", "social", "other",
