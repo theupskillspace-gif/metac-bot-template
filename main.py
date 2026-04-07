@@ -1411,7 +1411,7 @@ if __name__ == "__main__":
     if run_mode == "tournament":
         r1 = asyncio.run(bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
         r2 = asyncio.run(bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID,       return_exceptions=True))
-        r3 = asyncio.run(bot.forecast_on_tournament("market-pulse-26q1",               return_exceptions=True))
+        r3 = asyncio.run(bot.forecast_on_tournament("market-pulse-26q2",               return_exceptions=True))
         forecast_reports = r1 + r2 + r3
 
     elif run_mode == "metaculus_cup":
