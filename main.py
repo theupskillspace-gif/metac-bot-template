@@ -985,9 +985,7 @@ class UpskillBot(ForecastBot):
             Research: {research}
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
-            Reason briefly:
-            (a) Base rate  (b) Time left  (c) Status quo
-            (d) YES drivers  (e) NO drivers  (f) Bias check  (g) Synthesis
+            Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             End with: "Probability: ZZ%" (0-100)
@@ -1044,9 +1042,7 @@ class UpskillBot(ForecastBot):
             Research: {research}
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
-            Reason briefly:
-            (a) Base rate per option  (b) Status quo  (c) Inside-view drivers
-            (d) Plausible surprise  (e) Bias check
+            Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             Avoid 0% unless logically impossible.
@@ -1103,9 +1099,7 @@ class UpskillBot(ForecastBot):
 
             Formatting: no scientific notation; percentiles strictly increasing.
 
-            Reason briefly:
-            (a) Base rate / trend  (b) Status quo  (c) Upside factors  (d) Downside factors
-            (e) Expert / market expectations  (f) Tail scenarios  (g) Interval-width bias check
+            Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
 
@@ -1166,9 +1160,7 @@ class UpskillBot(ForecastBot):
 
             Formatting: dates as YYYY-MM-DD; percentiles chronological and strictly increasing.
 
-            Reason briefly:
-            (a) Historical duration of similar events  (b) Time elapsed
-            (c) Accelerators  (d) Delays  (e) Expert/market timing  (f) Anchoring bias check
+            Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
 
