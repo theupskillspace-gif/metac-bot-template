@@ -906,7 +906,10 @@ class UpskillBot(ForecastBot):
         self._sources.register(PerplexitySource(api_key=perplexity_key))
 
         asknews_id     = os.getenv("ASKNEWS_CLIENT_ID",     "").strip()
-        asknews_secret = os.getenv("ASKNEWS_CLIENT_SECRET", "").strip()
+        asknews_secret = (
+            os.getenv("ASKNEWS_CLIENT_SECRET", "").strip()
+            or os.getenv("ASKNEWS_SECRET", "").strip()
+        )
         self._sources.register(AskNewsSource(
             client_id=asknews_id,
             client_secret=asknews_secret,
@@ -1091,6 +1094,57 @@ class UpskillBot(ForecastBot):
             blocks.extend(res)
         return "\n\n".join(b for b in blocks if b.strip()).strip()
 
+    def _format_metaculus_research(self, question: MetaculusQuestion) -> str:
+        lines: list[str] = ["[Metaculus]"]
+        if question.page_url:
+            lines.append(f"Question URL: {question.page_url}")
+
+        if question.background_info:
+            lines.append("Background:")
+            lines.append(question.background_info.strip())
+
+        if question.fine_print:
+            lines.append("Fine print:")
+            lines.append(question.fine_print.strip())
+
+        if question.num_forecasters is not None:
+            lines.append(f"Num forecasters: {question.num_forecasters}")
+        if question.num_predictions is not None:
+            lines.append(f"Num predictions: {question.num_predictions}")
+        if question.close_time is not None:
+            lines.append(f"Close time: {question.close_time.isoformat()}")
+        if question.published_time is not None:
+            lines.append(f"Published time: {question.published_time.isoformat()}")
+        if question.open_time is not None:
+            lines.append(f"Open time: {question.open_time.isoformat()}")
+        if question.cp_reveal_time is not None:
+            lines.append(f"Community prediction reveal time: {question.cp_reveal_time.isoformat()}")
+
+        community_prediction = getattr(question, "community_prediction_at_access_time", None)
+        if community_prediction is None:
+            try:
+                aggregations = (
+                    question.api_json.get("question", {}).get("aggregations", {})
+                    if isinstance(question.api_json, dict)
+                    else {}
+                )
+                community_prediction = (
+                    aggregations.get("recency_weighted", {}).get("latest", {}).get("centers")
+                    or aggregations.get("unweighted", {}).get("latest", {}).get("centers")
+                )
+                if isinstance(community_prediction, list) and len(community_prediction) == 1:
+                    community_prediction = community_prediction[0]
+                else:
+                    community_prediction = None
+            except Exception:
+                community_prediction = None
+
+        if community_prediction is not None:
+            lines.append(f"Community prediction: {community_prediction}")
+
+        result = "\n".join(line for line in lines if line is not None and str(line).strip())
+        return result.strip()
+
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             cached = await self._research_cache.get(question.page_url)
@@ -1114,9 +1168,10 @@ class UpskillBot(ForecastBot):
             ).strip()
 
             source_bundle = await self._multi_source_research_bundle(question, profile)
+            metaculus_block = self._format_metaculus_research(question)
             research_raw  = (
-                f"{base}\n\n--- MULTI-SOURCE RESEARCH (AskNews / Perplexity / OpenRouter GPT-5 / Exa / Tavily) ---\n{source_bundle}"
-                if source_bundle else base
+                f"{base}\n\n--- MULTI-SOURCE RESEARCH (Metaculus / AskNews / Perplexity / OpenRouter GPT-5 / Exa / Tavily) ---\n{metaculus_block}\n\n{source_bundle}"
+                if source_bundle else f"{base}\n\n--- Metaculus research ---\n{metaculus_block}"
             )
 
             summarize_prompt = clean_indents(
