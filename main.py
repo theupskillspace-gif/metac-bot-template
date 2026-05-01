@@ -1,4 +1,3 @@
-
 import argparse
 import asyncio
 import json
@@ -798,6 +797,43 @@ class ExtremizationConfig:
     conservative_ceil:  float = 0.98
 
 
+# ---------------------------------------------------------------------------
+# Per-tournament extremization configs
+# ---------------------------------------------------------------------------
+
+# AI competition: aggressive extremization (default)
+_AI_COMP_EXT_CFG = ExtremizationConfig(
+    enabled=True,
+    factor=1.65,
+    floor=0.02,
+    ceil=0.98,
+    conservative_floor=0.03,
+    conservative_ceil=0.97,
+)
+
+# Minibench: MORE extremization because predictions are too wishy-washy.
+# Pushes 52% → ~58%, 60% → ~75%, 70% → ~83%.
+# Bump factor to 2.2 or 2.5 if still too conservative after reviewing Brier scores.
+_MINIBENCH_EXT_CFG = ExtremizationConfig(
+    enabled=True,
+    factor=2.0,
+    floor=0.03,
+    ceil=0.97,
+    conservative_floor=0.04,
+    conservative_ceil=0.96,
+)
+
+# Market-pulse: moderate extremization
+_MARKET_PULSE_EXT_CFG = ExtremizationConfig(
+    enabled=True,
+    factor=1.45,
+    floor=0.03,
+    ceil=0.97,
+    conservative_floor=0.04,
+    conservative_ceil=0.96,
+)
+
+
 def _logit(p: float) -> float:
     p = min(1.0 - 1e-12, max(1e-12, p))
     return math.log(p / (1.0 - p))
@@ -817,7 +853,6 @@ def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
         if cfg.middle_band_low <= p <= cfg.middle_band_high:
             p = cfg.middle_push_low if p < 0.5 else cfg.middle_push_high
         extremized = max(cfg.floor, min(cfg.ceil, _sigmoid(_logit(p) * cfg.factor)))
-    # Conservativeness gate: never publish outside [conservative_floor, conservative_ceil]
     return max(cfg.conservative_floor, min(cfg.conservative_ceil, extremized))
 
 
@@ -828,7 +863,7 @@ def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
 class UpskillBot(ForecastBot):
     """
     UpskillBot – superforecaster bot with multi-API research (AskNews, Perplexity Sonar Pro, OpenRouter GPT-5, Exa, Tavily),
-    aggressive extremization, and a conservativeness gate before publishing.
+    per-tournament extremization, and a conservativeness gate before publishing.
     """
 
     _max_concurrent_questions = 3
@@ -858,6 +893,9 @@ class UpskillBot(ForecastBot):
         self._validator      = ForecastValidator()
         self._analyser       = QuestionAnalyser(self.get_llm("researcher", "llm"))
 
+        # Active tournament tracking for per-tournament extremization
+        self._active_tournament_id: str = ""
+
         # Source registry: AskNews + Perplexity + OpenRouter + Tavily + Exa
         self._sources = SourceRegistry()
 
@@ -884,6 +922,7 @@ class UpskillBot(ForecastBot):
         exa_key = os.getenv("EXA_API_KEY", "").strip()
         self._sources.register(ExaSource(api_key=exa_key))
 
+        # Default extremization config (used when no tournament context is set)
         self._ext_cfg = ExtremizationConfig(
             enabled=os.getenv("EXTREMIZE_ENABLED", "true").lower() in ["1","true","yes","y"],
             factor=float(os.getenv("EXTREMIZE_FACTOR", "3.2")),
@@ -894,22 +933,37 @@ class UpskillBot(ForecastBot):
         )
 
     # -------------------------------------------------------------------
+    # Per-tournament extremization resolver
+    # -------------------------------------------------------------------
+
+    def _get_ext_cfg(self, tournament_id: str | None = None) -> ExtremizationConfig:
+        """
+        Return the correct ExtremizationConfig for the active tournament.
+
+        Minibench gets factor=2.0 (more aggressive) because the bot's raw
+        LLM outputs are too wishy-washy (e.g. 52% when 70% is warranted).
+        Adjust _MINIBENCH_EXT_CFG.factor to 2.2 or 2.5 if still too conservative
+        after reviewing Brier scores.
+        """
+        tid = str(tournament_id or self._active_tournament_id).lower()
+        client = MetaculusClient()
+        minibench_id = str(getattr(client, "CURRENT_MINIBENCH_ID", "")).lower()
+        if "minibench" in tid or (minibench_id and tid == minibench_id):
+            return _MINIBENCH_EXT_CFG
+        if "market-pulse" in tid:
+            return _MARKET_PULSE_EXT_CFG
+        if tid:
+            # Check against AI competition ID
+            ai_comp_id = str(getattr(client, "CURRENT_AI_COMPETITION_ID", "")).lower()
+            if tid == ai_comp_id:
+                return _AI_COMP_EXT_CFG
+        return self._ext_cfg
+
+    # -------------------------------------------------------------------
     # Public API: register additional client data sources
     # -------------------------------------------------------------------
 
     def register_source(self, source: BaseSource) -> None:
-        """
-        Register a custom data source (proprietary DB, specialised API, etc.).
-
-        Example
-        -------
-        class MyDB(BaseSource):
-            name = "my_db"
-            async def fetch(self, query: str) -> str:
-                return my_db.search(query)
-
-        bot.register_source(MyDB())
-        """
         self._sources.register(source)
 
     # -------------------------------------------------------------------
@@ -935,7 +989,7 @@ class UpskillBot(ForecastBot):
         return await self.get_llm(model_key, "llm").invoke(prompt)
 
     # -------------------------------------------------------------------
-    # Superforecasting preamble (brief but succinct)
+    # Superforecasting preamble
     # -------------------------------------------------------------------
 
     @staticmethod
@@ -955,13 +1009,29 @@ class UpskillBot(ForecastBot):
         ).strip()
 
     # -------------------------------------------------------------------
-    # Research – adaptive, multi-source (Exa + Tavily + AskNews)
+    # Anti-hedging instruction (injected into binary prompts)
+    # -------------------------------------------------------------------
+
+    @staticmethod
+    def _anti_hedging_instruction() -> str:
+        return clean_indents(
+            """
+            ## Conviction requirement
+            Do not hedge toward 50% out of caution or politeness.
+            If your reasoning points clearly in one direction, commit to it.
+            Answers like 48%–52% are only appropriate when evidence is genuinely
+            balanced on both sides. Express your actual conviction based on the
+            evidence — a well-reasoned 75% is better than a timid 53%.
+            """
+        ).strip()
+
+    # -------------------------------------------------------------------
+    # Research – adaptive, multi-source
     # -------------------------------------------------------------------
 
     async def _plan_queries(
         self, question: MetaculusQuestion, profile: QuestionProfile
     ) -> list[str]:
-        """Build a targeted research query plan for the question (was: _decompose_question)."""
         geo_hint = f" (geography: {profile.geography})" if profile.geography else ""
         prompt = clean_indents(
             f"""
@@ -1102,11 +1172,14 @@ class UpskillBot(ForecastBot):
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
         profile, strategy = await self._get_profile_and_strategy(question)
+        ext_cfg = self._get_ext_cfg()
         prompt = clean_indents(
             f"""
             You are UpskillBot, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
+
+            {self._anti_hedging_instruction()}
 
             {ModellingStrategy.get_prompt_block(strategy, profile)}
 
@@ -1125,13 +1198,16 @@ class UpskillBot(ForecastBot):
             End with: "Probability: ZZ%" (0-100)
             """
         )
-        result = await self._binary_prompt_to_forecast(question, prompt)
+        result = await self._binary_prompt_to_forecast(question, prompt, ext_cfg=ext_cfg)
         self._validator.validate(question, profile, strategy, result.prediction_value, research)
         return result
 
     async def _binary_prompt_to_forecast(
-        self, question: BinaryQuestion, prompt: str
+        self, question: BinaryQuestion, prompt: str,
+        ext_cfg: ExtremizationConfig | None = None,
     ) -> ReasonedPrediction[float]:
+        if ext_cfg is None:
+            ext_cfg = self._get_ext_cfg()
         try:
             reasoning = await self._llm_invoke("default", prompt)
         except Exception as exc:
@@ -1145,8 +1221,13 @@ class UpskillBot(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
         )
         raw_p = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        extremized_p = extremize_probability(raw_p, ext_cfg)
+        logger.info(
+            f"[UpskillBot] Extremization: raw={raw_p:.3f} → {extremized_p:.3f} "
+            f"(factor={ext_cfg.factor}, tournament={self._active_tournament_id or 'unknown'})"
+        )
         return ReasonedPrediction(
-            prediction_value=extremize_probability(raw_p, self._ext_cfg),
+            prediction_value=extremized_p,
             reasoning=reasoning,
         )
 
@@ -1160,9 +1241,11 @@ class UpskillBot(ForecastBot):
         profile, strategy = await self._get_profile_and_strategy(question)
         prompt = clean_indents(
             f"""
-            You are UpskillBot, a professional superforecaster.
+            You are UpskillBot, a professional superforecaster aiming for accurate forecasts and high scores on metaculus.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
+
+            {self._anti_hedging_instruction()}
 
             {ModellingStrategy.get_prompt_block(strategy, profile)}
 
@@ -1372,10 +1455,11 @@ class UpskillBot(ForecastBot):
         yes_info,    full_research = await self._get_question_prediction_info(question.question_yes, full_research, "yes")
         no_info,     full_research = await self._get_question_prediction_info(question.question_no,  full_research, "no")
 
+        ext_cfg = self._get_ext_cfg()
         for info in [parent_info, child_info, yes_info, no_info]:
             pv = getattr(info, "prediction_value", None)
             if isinstance(pv, float):
-                info.prediction_value = extremize_probability(pv, self._ext_cfg)  # type: ignore[attr-defined]
+                info.prediction_value = extremize_probability(pv, ext_cfg)  # type: ignore[attr-defined]
 
         full_reasoning = clean_indents(
             f"""
@@ -1444,7 +1528,7 @@ class UpskillBot(ForecastBot):
         return "Forecast ONLY the CHILD question given the parent's resolution. Do not re-forecast the parent."
 
     # -------------------------------------------------------------------
-    # Extremization – top-level sweep (floats skipped; done at source)
+    # Extremization – top-level sweep
     # -------------------------------------------------------------------
 
     def _extremize_report_if_numeric(self, report: Any) -> None:
@@ -1454,7 +1538,7 @@ class UpskillBot(ForecastBot):
                 return   # already extremized at point of creation
             if isinstance(pv, NumericDistribution):
                 median_p     = pv.percentile_at_value(pv.median) / 100.0
-                extremized_p = extremize_probability(median_p, self._ext_cfg)
+                extremized_p = extremize_probability(median_p, self._get_ext_cfg())
                 if abs(extremized_p - median_p) > 1e-6:
                     logger.debug(f"[UpskillBot] Numeric extremization: {median_p:.3f} → {extremized_p:.3f}")
         except Exception:
@@ -1488,6 +1572,13 @@ class UpskillBot(ForecastBot):
 # Entry point
 # ===========================================================================
 
+async def _run_tournament(bot: UpskillBot, tournament_id: str | int) -> list[Any]:
+    """Run a single tournament, setting active tournament context for correct extremization."""
+    bot._active_tournament_id = str(tournament_id)
+    logger.info(f"[UpskillBot] Starting tournament={tournament_id} ext_cfg=factor={bot._get_ext_cfg(str(tournament_id)).factor}")
+    return await bot.forecast_on_tournament(tournament_id, return_exceptions=True)
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -1505,14 +1596,11 @@ if __name__ == "__main__":
     args    = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
-    # -----------------------------------------------------------------------
-    # Client specialisation – edit this block to tune for a specific client
-    # -----------------------------------------------------------------------
     spec = ClientSpecialisation(
-        domain_focus=[],           # e.g. ["economics", "finance"]
-        trusted_domains=[],        # e.g. ["reuters.com", "ft.com"]
-        excluded_domains=[],       # e.g. ["reddit.com"]
-        extra_context="",          # inject proprietary intelligence here
+        domain_focus=[],
+        trusted_domains=[],
+        excluded_domains=[],
+        extra_context="",
         calibration_target=0.15,
     )
 
@@ -1527,21 +1615,21 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=False,
     )
 
-    # -----------------------------------------------------------------------
-    # Register additional client sources here, e.g.:
-    #   bot.register_source(MyProprietaryDB())
-    # -----------------------------------------------------------------------
-
     client = MetaculusClient()
 
     if run_mode == "tournament":
-        r1 = asyncio.run(bot.forecast_on_tournament(33022,                            return_exceptions=True))
-        r2 = asyncio.run(bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID,       return_exceptions=True))
-        r3 = asyncio.run(bot.forecast_on_tournament("market-pulse-26q2",               return_exceptions=True))
+        # Each tournament runs with its own extremization config via _active_tournament_id.
+        # Minibench: factor=2.0 (more aggressive — raw LLM outputs are too wishy-washy).
+        # AI comp:   factor=1.65 (default aggressive).
+        # Market-pulse: factor=1.45 (moderate).
+        r1 = asyncio.run(_run_tournament(bot, 33022))
+        r2 = asyncio.run(_run_tournament(bot, client.CURRENT_MINIBENCH_ID))
+        r3 = asyncio.run(_run_tournament(bot, "market-pulse-26q2"))
         forecast_reports = r1 + r2 + r3
 
     elif run_mode == "metaculus_cup":
         bot.skip_previously_forecasted_questions = False
+        bot._active_tournament_id = str(client.CURRENT_METACULUS_CUP_ID)
         forecast_reports = asyncio.run(
             bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
         )
@@ -1554,6 +1642,7 @@ if __name__ == "__main__":
             "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
         ]
         bot.skip_previously_forecasted_questions = False
+        bot._active_tournament_id = "test"
         questions        = [client.get_question_by_url(u) for u in EXAMPLE_QUESTIONS]
         forecast_reports = asyncio.run(
             bot.forecast_questions(questions, return_exceptions=True)
