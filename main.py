@@ -45,9 +45,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-_CLAUDE_OPUS_MODEL   = "openrouter/anthropic/claude-opus-4-6"
-_CLAUDE_SONNET_MODEL = "openrouter/anthropic/claude-sonnet-4-6"
-_GPT_MODEL           = "openrouter/openai/gpt-5.4-mini"
+_CLAUDE_OPUS_MODEL      = "openrouter/anthropic/claude-opus-4-6"
+_CLAUDE_SONNET_MODEL    = "openrouter/anthropic/claude-sonnet-4-6"
+_GPT_MODEL              = "openrouter/openai/gpt-5.4-mini"
+_PERPLEXITY_MODEL       = "llama-3.1-sonar-pro-128k"
 DOMAINS = [
     "geopolitics", "economics", "technology", "science",
     "public_health", "environment", "sports", "finance", "social", "other",
@@ -469,6 +470,122 @@ class AskNewsSource(BaseSource):
             return f"Query: {query}\n- AskNews failed: {type(exc).__name__}: {exc}"
 
 
+class PerplexitySource(BaseSource):
+    """Perplexity Sonar Pro semantic research."""
+    name = "perplexity_sonar_pro"
+    _API_URL = "https://api.perplexity.ai/chat/completions"
+
+    def __init__(self, api_key: str, timeout_s: int = 30, model: str | None = None):
+        self._api_key   = api_key
+        self._timeout_s = timeout_s
+        self._model     = model or _PERPLEXITY_MODEL
+
+    def is_available(self) -> bool:
+        return bool(self._api_key)
+
+    async def fetch(self, query: str) -> str:
+        if not self._api_key:
+            return ""
+        payload = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert search assistant for current events and forecasting. "
+                        "Provide concise but evidence-rich summaries of the most relevant news, "
+                        "expert commentary, and market signals for this question."
+                    ),
+                },
+                {"role": "user", "content": query},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 1200,
+        }
+        headers = {
+            "accept": "application/json",
+            "authorization": f"Bearer {self._api_key}",
+            "content-type": "application/json",
+        }
+        try:
+            response = await asyncio.to_thread(
+                requests.post,
+                self._API_URL,
+                json=payload,
+                headers=headers,
+                timeout=self._timeout_s,
+            )
+            if not response.ok:
+                return f"Query: {query}\n- Perplexity failed: {response.status_code} {response.text}"
+            data = response.json()
+            content = (
+                data.get("choices", [{}])[0].get("message", {}).get("content")
+                or data.get("output")
+                or ""
+            )
+            return f"[Perplexity Sonar Pro]\nQuery: {query}\n{content.strip()}"
+        except Exception as exc:
+            return f"Query: {query}\n- Perplexity failed: {type(exc).__name__}: {exc}"
+
+
+class OpenRouterSearchSource(BaseSource):
+    """OpenRouter GPT-5 search-style research."""
+    name = "openrouter_gpt5_search"
+    _API_URL = "https://openrouter.ai/v1/chat/completions"
+
+    def __init__(self, api_key: str, model: str | None = None, timeout_s: int = 30):
+        self._api_key   = api_key
+        self._model     = model or _GPT_MODEL
+        self._timeout_s = timeout_s
+
+    def is_available(self) -> bool:
+        return bool(self._api_key)
+
+    async def fetch(self, query: str) -> str:
+        if not self._api_key:
+            return ""
+        payload = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a search and summarization assistant. "
+                        "For the query below, return the most relevant up-to-date evidence, "
+                        "key facts, and context that a forecaster would need. "
+                        "Do not produce a forecast."
+                    ),
+                },
+                {"role": "user", "content": query},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 1200,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            response = await asyncio.to_thread(
+                requests.post,
+                self._API_URL,
+                json=payload,
+                headers=headers,
+                timeout=self._timeout_s,
+            )
+            if not response.ok:
+                return f"Query: {query}\n- OpenRouter search failed: {response.status_code} {response.text}"
+            data = response.json()
+            content = (
+                data.get("choices", [{}])[0].get("message", {}).get("content")
+                or data.get("output")
+                or ""
+            )
+            return f"[OpenRouter GPT-5 Search]\nQuery: {query}\n{content.strip()}"
+        except Exception as exc:
+            return f"Query: {query}\n- OpenRouter search failed: {type(exc).__name__}: {exc}"
+
+
 # ===========================================================================
 # 4. FORECAST VALIDATOR
 # ===========================================================================
@@ -662,18 +779,23 @@ class ResearchCache:
 
 # ===========================================================================
 # 7. EXTREMIZATION HELPERS
-#    Aggressive logit-space extremization (factor=1.65) + conservativeness gate.
+#    Aggressive logit-space extremization for extreme forecasts + conservativeness gate.
 # ===========================================================================
 
 @dataclass
 class ExtremizationConfig:
     enabled: bool  = True
-    factor:  float = 1.65   # raised from 1.45 → more extreme
-    floor:   float = 0.02
-    ceil:    float = 0.98
+    factor:  float = 3.2   # stronger extremization for extreme minkbench-style forecasts
+    floor:   float = 0.01
+    ceil:    float = 0.99
+    # Middle avoidance: push modest forecasts out of the center.
+    middle_band_low:  float = 0.25
+    middle_band_high: float = 0.75
+    middle_push_low:  float = 0.15
+    middle_push_high: float = 0.85
     # Conservativeness gate: hard-clip extremes before publishing
-    conservative_floor: float = 0.03
-    conservative_ceil:  float = 0.97
+    conservative_floor: float = 0.02
+    conservative_ceil:  float = 0.98
 
 
 def _logit(p: float) -> float:
@@ -692,6 +814,8 @@ def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
     if not cfg.enabled:
         extremized = max(cfg.floor, min(cfg.ceil, p))
     else:
+        if cfg.middle_band_low <= p <= cfg.middle_band_high:
+            p = cfg.middle_push_low if p < 0.5 else cfg.middle_push_high
         extremized = max(cfg.floor, min(cfg.ceil, _sigmoid(_logit(p) * cfg.factor)))
     # Conservativeness gate: never publish outside [conservative_floor, conservative_ceil]
     return max(cfg.conservative_floor, min(cfg.conservative_ceil, extremized))
@@ -703,7 +827,7 @@ def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
 
 class UpskillBot(ForecastBot):
     """
-    UpskillBot – superforecaster bot with multi-API research (Exa, Tavily, AskNews),
+    UpskillBot – superforecaster bot with multi-API research (AskNews, Perplexity Sonar Pro, OpenRouter GPT-5, Exa, Tavily),
     aggressive extremization, and a conservativeness gate before publishing.
     """
 
@@ -719,12 +843,11 @@ class UpskillBot(ForecastBot):
     def __init__(self, *args, client_spec: ClientSpecialisation | None = None, **kwargs):
         llms = kwargs.pop("llms", None)
         if llms is None:
-            opus_llm   = GeneralLlm(model=_CLAUDE_OPUS_MODEL,   temperature=0.15, timeout=90, allowed_tries=3)
-            sonnet_llm = GeneralLlm(model=_CLAUDE_SONNET_MODEL, temperature=0.15, timeout=60, allowed_tries=3)
-            gpt_llm    = GeneralLlm(model=_GPT_MODEL,           temperature=0.15, timeout=60, allowed_tries=3)
+            sonnet_llm = GeneralLlm(model=_CLAUDE_SONNET_MODEL, temperature=0.10, timeout=90, allowed_tries=3)
+            gpt_llm    = GeneralLlm(model=_GPT_MODEL,           temperature=0.15, timeout=90, allowed_tries=3)
             llms = {
-                "default":    opus_llm,
-                "summarizer": sonnet_llm,
+                "default":    sonnet_llm,
+                "summarizer": gpt_llm,
                 "researcher": gpt_llm,
                 "parser":     gpt_llm,
             }
@@ -735,18 +858,14 @@ class UpskillBot(ForecastBot):
         self._validator      = ForecastValidator()
         self._analyser       = QuestionAnalyser(self.get_llm("researcher", "llm"))
 
-        # Source registry: Exa + Tavily + AskNews
+        # Source registry: AskNews + Perplexity + OpenRouter + Tavily + Exa
         self._sources = SourceRegistry()
 
-        exa_key = os.getenv("EXA_API_KEY", "").strip()
-        self._sources.register(ExaSource(api_key=exa_key))
+        openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        self._sources.register(OpenRouterSearchSource(api_key=openrouter_key))
 
-        tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
-        self._sources.register(TavilySource(
-            api_key=tavily_key,
-            include_domains=self._client_spec.trusted_domains or None,
-            exclude_domains=self._client_spec.excluded_domains or None,
-        ))
+        perplexity_key = os.getenv("PERPLEXITY_API_KEY", "").strip()
+        self._sources.register(PerplexitySource(api_key=perplexity_key))
 
         asknews_id     = os.getenv("ASKNEWS_CLIENT_ID",     "").strip()
         asknews_secret = os.getenv("ASKNEWS_CLIENT_SECRET", "").strip()
@@ -755,13 +874,23 @@ class UpskillBot(ForecastBot):
             client_secret=asknews_secret,
         ))
 
+        tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
+        self._sources.register(TavilySource(
+            api_key=tavily_key,
+            include_domains=self._client_spec.trusted_domains or None,
+            exclude_domains=self._client_spec.excluded_domains or None,
+        ))
+
+        exa_key = os.getenv("EXA_API_KEY", "").strip()
+        self._sources.register(ExaSource(api_key=exa_key))
+
         self._ext_cfg = ExtremizationConfig(
             enabled=os.getenv("EXTREMIZE_ENABLED", "true").lower() in ["1","true","yes","y"],
-            factor=float(os.getenv("EXTREMIZE_FACTOR", "1.65")),
-            floor=float(os.getenv("EXTREMIZE_FLOOR",  "0.02")),
-            ceil=float(os.getenv("EXTREMIZE_CEIL",    "0.98")),
-            conservative_floor=float(os.getenv("CONSERVATIVE_FLOOR", "0.03")),
-            conservative_ceil=float(os.getenv("CONSERVATIVE_CEIL",  "0.97")),
+            factor=float(os.getenv("EXTREMIZE_FACTOR", "3.2")),
+            floor=float(os.getenv("EXTREMIZE_FLOOR",  "0.01")),
+            ceil=float(os.getenv("EXTREMIZE_CEIL",    "0.99")),
+            conservative_floor=float(os.getenv("CONSERVATIVE_FLOOR", "0.02")),
+            conservative_ceil=float(os.getenv("CONSERVATIVE_CEIL",  "0.98")),
         )
 
     # -------------------------------------------------------------------
@@ -880,11 +1009,16 @@ class UpskillBot(ForecastBot):
             if q2 and q2 not in seen:
                 seen.add(q2); all_queries.append(q2)
 
+        await self._throttle_search()
+        query_tasks = [self._sources.fetch_all(q) for q in all_queries]
+        results = await asyncio.gather(*query_tasks, return_exceptions=True)
+
         blocks: list[str] = []
-        for q in all_queries:
-            await self._throttle_search()
-            source_results = await self._sources.fetch_all(q)
-            blocks.extend(source_results)
+        for q, res in zip(all_queries, results):
+            if isinstance(res, Exception):
+                blocks.append(f"[research] Query '{q}' failed: {type(res).__name__}: {res}")
+                continue
+            blocks.extend(res)
         return "\n\n".join(b for b in blocks if b.strip()).strip()
 
     async def run_research(self, question: MetaculusQuestion) -> str:
@@ -911,7 +1045,7 @@ class UpskillBot(ForecastBot):
 
             source_bundle = await self._multi_source_research_bundle(question, profile)
             research_raw  = (
-                f"{base}\n\n--- MULTI-SOURCE RESEARCH (Exa / Tavily / AskNews) ---\n{source_bundle}"
+                f"{base}\n\n--- MULTI-SOURCE RESEARCH (AskNews / Perplexity / OpenRouter GPT-5 / Exa / Tavily) ---\n{source_bundle}"
                 if source_bundle else base
             )
 
@@ -1390,7 +1524,7 @@ if __name__ == "__main__":
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
+        extra_metadata_in_explanation=False,
     )
 
     # -----------------------------------------------------------------------
@@ -1401,7 +1535,7 @@ if __name__ == "__main__":
     client = MetaculusClient()
 
     if run_mode == "tournament":
-        r1 = asyncio.run(bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
+        r1 = asyncio.run(bot.forecast_on_tournament(33022,                            return_exceptions=True))
         r2 = asyncio.run(bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID,       return_exceptions=True))
         r3 = asyncio.run(bot.forecast_on_tournament("market-pulse-26q2",               return_exceptions=True))
         forecast_reports = r1 + r2 + r3
