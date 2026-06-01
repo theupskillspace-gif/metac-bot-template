@@ -907,10 +907,10 @@ class UpskillBot(ForecastBot):
         self._analyser       = QuestionAnalyser(self.get_llm("researcher", "llm"))
 
         # Committee voting preference (can be set from CLI)
-        self._use_committee_voting = False
+        self._use_committee_voting = True
 
         # Active tournament tracking for per-tournament extremization
-        self._active_tournament_id: str = ""
+        self._active_tournament_id: str = "minibench"
 
         # Source registry: AskNews + Perplexity + OpenRouter + Tavily + Exa
         self._sources = SourceRegistry()
