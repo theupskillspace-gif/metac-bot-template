@@ -3,7 +3,7 @@ name: Forecast on new AI tournament questions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
+    - cron: "*/35 * * * *" # runs every 35 minutes. Make sure to skip already forecasted questions!
 
 # Add concurrency group to prevent parallel runs
 concurrency:
