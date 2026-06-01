@@ -14,6 +14,8 @@ from typing import Any, Literal
 from urllib.request import Request, urlopen
 
 import dotenv
+import numpy as np
+import requests
 
 from forecasting_tools import (
     BinaryPrediction,
@@ -24,6 +26,7 @@ from forecasting_tools import (
     DateQuestion,
     ForecastBot,
     GeneralLlm,
+    MetaculusApi,
     MetaculusClient,
     MetaculusQuestion,
     MultipleChoiceQuestion,
@@ -38,16 +41,32 @@ from forecasting_tools import (
     structure_output,
 )
 
+try:
+    from tavily import TavilyClient
+except ImportError:
+    TavilyClient = None
+
+try:
+    from newsapi import NewsApiClient
+except ImportError:
+    NewsApiClient = None
+
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+# Environment & API Keys
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
 _CLAUDE_OPUS_MODEL      = "openrouter/anthropic/claude-opus-4-6"
 _CLAUDE_SONNET_MODEL    = "openrouter/anthropic/claude-sonnet-4-6"
-_GPT_MODEL              = "openrouter/openai/gpt-5.4-mini"
-_PERPLEXITY_MODEL       = "llama-3.1-sonar-pro-128k"
+_GPT_MODEL              = "openrouter/openai/gpt-5"
+_CLAUDE_4_MODEL         = "openrouter/anthropic/claude-4"
+_PERPLEXITY_MODEL       = "openrouter/openai/gpt5"
 DOMAINS = [
     "geopolitics", "economics", "technology", "science",
     "public_health", "environment", "sports", "finance", "social", "other",
@@ -881,7 +900,7 @@ class UpskillBot(ForecastBot):
             sonnet_llm = GeneralLlm(model=_CLAUDE_SONNET_MODEL, temperature=0.10, timeout=90, allowed_tries=3)
             gpt_llm    = GeneralLlm(model=_GPT_MODEL,           temperature=0.15, timeout=90, allowed_tries=3)
             llms = {
-                "default":    sonnet_llm,
+                "default":    gpt_llm,
                 "summarizer": gpt_llm,
                 "researcher": gpt_llm,
                 "parser":     gpt_llm,
@@ -892,6 +911,9 @@ class UpskillBot(ForecastBot):
         self._research_cache = ResearchCache()
         self._validator      = ForecastValidator()
         self._analyser       = QuestionAnalyser(self.get_llm("researcher", "llm"))
+
+        # Committee voting preference (can be set from CLI)
+        self._use_committee_voting = False
 
         # Active tournament tracking for per-tournament extremization
         self._active_tournament_id: str = ""
@@ -1031,6 +1053,30 @@ class UpskillBot(ForecastBot):
     # -------------------------------------------------------------------
     # Research – adaptive, multi-source
     # -------------------------------------------------------------------
+
+    def call_tavily(self, query: str) -> str:
+        """Call Tavily search API."""
+        if not TAVILY_API_KEY or not TavilyClient:
+            return ""
+        try:
+            tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+            response = tavily_client.search(query=query, search_depth="advanced")
+            return "\n".join([f"- {c['content']}" for c in response.get('results', [])])
+        except Exception as e:
+            return f"Tavily failed: {e}"
+
+    def call_newsapi(self, query: str) -> str:
+        """Call NewsAPI for recent news."""
+        if not NEWSAPI_API_KEY or not NewsApiClient:
+            return ""
+        try:
+            newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
+            articles = newsapi_client.get_everything(q=query, language='en', sort_by='relevancy', page_size=5)
+            if not articles or not articles.get('articles'):
+                return ""
+            return "\n".join([f"- Title: {a['title']}\n  Snippet: {a.get('description', 'N/A')}" for a in articles['articles']])
+        except Exception as e:
+            return f"NewsAPI failed: {e}"
 
     async def _plan_queries(
         self, question: MetaculusQuestion, profile: QuestionProfile
@@ -1285,6 +1331,184 @@ class UpskillBot(ForecastBot):
             prediction_value=extremized_p,
             reasoning=reasoning,
         )
+
+    # -------------------------------------------------------------------
+    # Committee voting methods (hybrid pre-mortem features)
+    # -------------------------------------------------------------------
+
+    async def _single_forecast(
+        self, 
+        question: BinaryQuestion | MultipleChoiceQuestion | NumericQuestion,
+        research: str,
+        use_claude: bool = False
+    ) -> tuple[Any, str]:
+        """Generate a single forecast using specified model."""
+        if use_claude:
+            original_default = self._llms.get("default")
+            original_parser = self._llms.get("parser")
+            self._llms["default"] = GeneralLlm(model=_CLAUDE_4_MODEL, temperature=0.1, timeout=90, allowed_tries=3)
+            self._llms["parser"] = GeneralLlm(model=_CLAUDE_4_MODEL, temperature=0.1, timeout=90, allowed_tries=3)
+
+        try:
+            if isinstance(question, BinaryQuestion):
+                profile, strategy = await self._get_profile_and_strategy(question)
+                prompt = clean_indents(f"""
+                You are a professional forecaster.
+
+                Question: {question.question_text}
+                Background: {question.background_info}
+                Resolution: {question.resolution_criteria}
+                Fine print: {question.fine_print}
+                Research: {research}
+                Today: {datetime.now().strftime("%Y-%m-%d")}
+
+                Write analysis, then end with: "Probability: ZZ%"
+                """)
+                reasoning = await self._llm_invoke("default", prompt)
+                pred: BinaryPrediction = await structure_output(reasoning, BinaryPrediction, model=self.get_llm("parser", "llm"))
+                result = max(0.01, min(0.99, pred.prediction_in_decimal))
+
+            elif isinstance(question, MultipleChoiceQuestion):
+                prompt = clean_indents(f"""
+                Question: {question.question_text}
+                Options: {question.options}
+                Background: {question.background_info}
+                Resolution: {question.resolution_criteria}
+                Research: {research}
+                Today: {datetime.now().strftime("%Y-%m-%d")}
+
+                Write analysis, then list probabilities for each option in order.
+                """)
+                reasoning = await self._llm_invoke("default", prompt)
+                result = await structure_output(
+                    reasoning, PredictedOptionList, model=self.get_llm("parser", "llm"),
+                    additional_instructions=f"Options must be exactly: {question.options}"
+                )
+
+            elif isinstance(question, NumericQuestion):
+                lower_msg = f"Lower bound: {'open' if question.open_lower_bound else 'closed'} at {question.lower_bound or question.nominal_lower_bound}"
+                upper_msg = f"Upper bound: {'open' if question.open_upper_bound else 'closed'} at {question.upper_bound or question.nominal_upper_bound}"
+                prompt = clean_indents(f"""
+                Question: {question.question_text}
+                Units: {question.unit_of_measure or 'Infer from context'}
+                Background: {question.background_info}
+                Resolution: {question.resolution_criteria}
+                {lower_msg}
+                {upper_msg}
+                Research: {research}
+                Today: {datetime.now().strftime("%Y-%m-%d")}
+
+                Write analysis, then provide percentiles: 10, 20, 40, 60, 80, 90.
+                """)
+                reasoning = await self._llm_invoke("default", prompt)
+                percentile_list: list[Percentile] = await structure_output(reasoning, list[Percentile], model=self.get_llm("parser", "llm"))
+                result = NumericDistribution.from_question(percentile_list, question)
+            else:
+                result = None
+        finally:
+            if use_claude:
+                # Restore GPT models
+                self._llms["default"] = original_default or GeneralLlm(model=_GPT_MODEL, temperature=0.15, timeout=90, allowed_tries=3)
+                self._llms["parser"] = original_parser or GeneralLlm(model=_GPT_MODEL, temperature=0.15, timeout=90, allowed_tries=3)
+
+        return result, reasoning
+
+    async def _run_forecast_on_binary_committee(
+        self, question: BinaryQuestion, research: str
+    ) -> ReasonedPrediction[float]:
+        """Run committee of GPT-5 (×2) + Claude-4 with median aggregation."""
+        forecasts = []
+        reasonings = []
+        for i in range(3):
+            use_claude = (i == 2)
+            try:
+                pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
+                if pred is not None and isinstance(pred, float):
+                    forecasts.append(pred)
+                    reasonings.append(reason)
+            except Exception as e:
+                logger.warning(f"[UpskillBot] Committee member {i} failed: {e}")
+                continue
+
+        if not forecasts:
+            logger.warning(f"[UpskillBot] All committee members failed for {question.page_url}")
+            return ReasonedPrediction(prediction_value=0.5, reasoning="Committee failed; returning 50% prior.")
+
+        median_pred = float(np.median(forecasts))
+        return ReasonedPrediction(prediction_value=median_pred, reasoning=" | ".join(reasonings))
+
+    async def _run_forecast_on_multiple_choice_committee(
+        self, question: MultipleChoiceQuestion, research: str
+    ) -> ReasonedPrediction[PredictedOptionList]:
+        """Run committee with median aggregation for multiple choice."""
+        forecasts = []
+        reasonings = []
+        for i in range(3):
+            use_claude = (i == 2)
+            try:
+                pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
+                if pred is not None and isinstance(pred, PredictedOptionList):
+                    forecasts.append(pred)
+                    reasonings.append(reason)
+            except Exception as e:
+                logger.warning(f"[UpskillBot] Committee member {i} failed: {e}")
+                continue
+
+        if not forecasts:
+            logger.warning(f"[UpskillBot] All committee members failed for {question.page_url}")
+            return ReasonedPrediction(prediction_value=PredictedOptionList([]), reasoning="Committee failed")
+
+        # Median per option
+        all_probs = np.array([[opt["probability"] for opt in f.predicted_options] for f in forecasts])
+        median_probs = np.median(all_probs, axis=0)
+        if median_probs.sum() > 0:
+            median_probs = median_probs / median_probs.sum()
+        else:
+            median_probs = np.full_like(median_probs, 1.0 / len(median_probs))
+        options = forecasts[0].predicted_options
+        median_forecast = PredictedOptionList([
+            {"option": opt["option"], "probability": float(p)} for opt, p in zip(options, median_probs)
+        ])
+        return ReasonedPrediction(prediction_value=median_forecast, reasoning=" | ".join(reasonings))
+
+    async def _run_forecast_on_numeric_committee(
+        self, question: NumericQuestion, research: str
+    ) -> ReasonedPrediction[NumericDistribution]:
+        """Run committee with median aggregation for numeric questions."""
+        forecasts = []
+        reasonings = []
+        for i in range(3):
+            use_claude = (i == 2)
+            try:
+                pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
+                if pred is not None and isinstance(pred, NumericDistribution):
+                    forecasts.append(pred)
+                    reasonings.append(reason)
+            except Exception as e:
+                logger.warning(f"[UpskillBot] Committee member {i} failed: {e}")
+                continue
+
+        if not forecasts:
+            logger.warning(f"[UpskillBot] All committee members failed for {question.page_url}")
+            return ReasonedPrediction(prediction_value=NumericDistribution([]), reasoning="Committee failed")
+
+        # Extract percentiles
+        target_percentiles = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+        aggregated = []
+        for p in target_percentiles:
+            values = []
+            for f in forecasts:
+                for item in f.declared_percentiles:
+                    if abs(item.percentile - p) < 0.01:
+                        values.append(item.value)
+                        break
+                else:
+                    values.append(0.0)
+            median_val = float(np.median(values)) if values else 0.0
+            aggregated.append(Percentile(percentile=p, value=median_val))
+        # Reconstruct using question bounds
+        distribution = NumericDistribution.from_question(aggregated, question)
+        return ReasonedPrediction(prediction_value=distribution, reasoning=" | ".join(reasonings))
 
     # -------------------------------------------------------------------
     # Multiple choice
@@ -1642,13 +1866,26 @@ if __name__ == "__main__":
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").propagate = False
 
-    parser = argparse.ArgumentParser(description="Run UpskillBot – superforecaster bot")
+    parser = argparse.ArgumentParser(description="Run Hybrid Pre-Mortem Bot (UpskillBot + HybridPreMortem features)")
     parser.add_argument(
         "--mode", type=str,
         choices=["tournament", "metaculus_cup", "test_questions"],
         default="tournament",
     )
-    args    = parser.parse_args()
+    parser.add_argument(
+        "--tournament-ids",
+        nargs="+",
+        type=str,
+        default=None,
+        help="Tournament IDs to forecast on (for tournament mode)"
+    )
+    parser.add_argument(
+        "--use-committee",
+        action="store_true",
+        default=False,
+        help="Use committee voting (GPT-5 x2 + Claude-4) with median aggregation"
+    )
+    args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     spec = ClientSpecialisation(
@@ -1662,7 +1899,7 @@ if __name__ == "__main__":
     bot = UpskillBot(
         client_spec=spec,
         research_reports_per_question=1,
-        predictions_per_research_report=3,
+        predictions_per_research_report=1 if args.use_committee else 3,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
@@ -1670,22 +1907,25 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=False,
     )
 
-    client = MetaculusClient()
+    # Store committee voting preference in bot instance
+    bot._use_committee_voting = args.use_committee
+    client = MetaculusApi()
 
     if run_mode == "tournament":
-        # Each tournament runs with its own extremization config via _active_tournament_id.
-        # Minibench: factor=2.0 (more aggressive — raw LLM outputs are too wishy-washy).
-        # AI comp:   factor=1.65 (default aggressive).
-        # Market-pulse: factor=1.45 (moderate).
-        r1 = asyncio.run(_run_tournament(bot, 33022))
-        r2 = asyncio.run(_run_tournament(bot, client.CURRENT_MINIBENCH_ID))
-        r3 = asyncio.run(_run_tournament(bot, "market-pulse-26q2"))
-        forecast_reports = r1 + r2 + r3
+        # Default tournament IDs if not specified
+        if args.tournament_ids is None:
+            args.tournament_ids = ["32813", "market-pulse-25q4", client.CURRENT_MINIBENCH_ID]
+
+        all_reports = []
+        for tid in args.tournament_ids:
+            logger.info(f"Forecasting on tournament: {tid}")
+            reports = asyncio.run(_run_tournament(bot, tid))
+            all_reports.extend(reports if isinstance(reports, list) else [reports])
 
     elif run_mode == "metaculus_cup":
         bot.skip_previously_forecasted_questions = False
         bot._active_tournament_id = str(client.CURRENT_METACULUS_CUP_ID)
-        forecast_reports = asyncio.run(
+        all_reports = asyncio.run(
             bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
         )
 
@@ -1698,9 +1938,14 @@ if __name__ == "__main__":
         ]
         bot.skip_previously_forecasted_questions = False
         bot._active_tournament_id = "test"
-        questions        = [client.get_question_by_url(u) for u in EXAMPLE_QUESTIONS]
-        forecast_reports = asyncio.run(
+        questions = [client.get_question_by_url(u) for u in EXAMPLE_QUESTIONS]
+        all_reports = asyncio.run(
             bot.forecast_questions(questions, return_exceptions=True)
         )
 
-    bot.log_report_summary(forecast_reports)
+    try:
+        bot.log_report_summary(all_reports)
+        logger.info("Run completed successfully.")
+    except Exception as e:
+        logger.error(f"Failed to log report summary: {e}")
+        logger.error(f"Total reports: {len(all_reports) if 'all_reports' in locals() else 0}")
