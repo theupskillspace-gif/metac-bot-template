@@ -1879,12 +1879,12 @@ if __name__ == "__main__":
 
     # Store committee voting preference in bot instance
     bot._use_committee_voting = args.use_committee
-    client = MetaculusApi()
+    client = MetaculusClient()
 
     if run_mode == "tournament":
         # Default tournament IDs if not specified
         if args.tournament_ids is None:
-            args.tournament_ids = ["32813", "market-pulse-25q4", client.CURRENT_MINIBENCH_ID]
+            args.tournament_ids = ["33022", "market-pulse-26q2", client.CURRENT_MINIBENCH_ID]
 
         all_reports = []
         for tid in args.tournament_ids:
@@ -1906,7 +1906,7 @@ if __name__ == "__main__":
             "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
             "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
         ]
-        bot.skip_previously_forecasted_questions = False
+        bot.skip_previously_forecasted_questions = True
         bot._active_tournament_id = "test"
         questions = [client.get_question_by_url(u) for u in EXAMPLE_QUESTIONS]
         all_reports = asyncio.run(
