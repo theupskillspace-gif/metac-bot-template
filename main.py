@@ -62,11 +62,11 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-_CLAUDE_OPUS_MODEL      = "openrouter/anthropic/claude-opus-4-6"
-_CLAUDE_SONNET_MODEL    = "openrouter/anthropic/claude-sonnet-4-6"
-_GPT_MODEL              = "openrouter/openai/gpt-5"
+_CLAUDE_OPUS_MODEL      = "openrouter/anthropic/claude-opus-4.6"
+_CLAUDE_SONNET_MODEL    = "openrouter/anthropic/claude-sonnet-4.6"
+_GPT_MODEL              = "openrouter/openai/gpt-5.1"
 _CLAUDE_4_MODEL         = "openrouter/anthropic/claude-4"
-_PERPLEXITY_MODEL       = "openrouter/openai/gpt5"
+_PERPLEXITY_MODEL       = "openrouter/perplexity/sonar-pro"
 DOMAINS = [
     "geopolitics", "economics", "technology", "science",
     "public_health", "environment", "sports", "finance", "social", "other",
