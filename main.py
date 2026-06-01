@@ -1274,66 +1274,87 @@ class UpskillBot(ForecastBot):
     ) -> ReasonedPrediction[float]:
         profile, strategy = await self._get_profile_and_strategy(question)
         ext_cfg = self._get_ext_cfg()
-        prompt = clean_indents(
-            f"""
-            You are UpskillBot, a professional superforecaster.
-            {self._client_context_block()}
-            {self._superforecasting_preamble()}
 
-            {self._anti_hedging_instruction()}
+        # Committee mode: 3 votes with median aggregation
+        if self._use_committee_voting:
+            forecasts = []
+            reasonings = []
+            for i in range(3):
+                use_claude = (i == 2)
+                try:
+                    pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
+                    if pred is not None and isinstance(pred, float):
+                        forecasts.append(pred)
+                        reasonings.append(reason)
+                except Exception as e:
+                    logger.warning(f"[UpskillBot] Committee member {i} failed: {e}")
+                    continue
 
-            {ModellingStrategy.get_prompt_block(strategy, profile)}
+            if not forecasts:
+                logger.warning(f"[UpskillBot] All committee members failed for {question.page_url}")
+                return ReasonedPrediction(prediction_value=0.5, reasoning="Committee failed; returning 50% prior.")
 
-            ---
+            median_pred = float(np.median(forecasts))
+            extremized_p = extremize_probability(median_pred, ext_cfg)
+            logger.info(
+                f"[UpskillBot] Committee binary: votes={forecasts} → median={median_pred:.3f} → extremized={extremized_p:.3f}"
+            )
+            result = ReasonedPrediction(prediction_value=extremized_p, reasoning=" | ".join(reasonings))
+        # Standard mode: single forecast
+        else:
+            prompt = clean_indents(
+                f"""
+                You are UpskillBot, a professional superforecaster.
+                {self._client_context_block()}
+                {self._superforecasting_preamble()}
 
-            Question: {question.question_text}
-            Background: {question.background_info}
-            Resolution criteria (not yet satisfied): {question.resolution_criteria}
-            {question.fine_print}
-            Research: {research}
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+                {self._anti_hedging_instruction()}
 
-            Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
+                {ModellingStrategy.get_prompt_block(strategy, profile)}
 
-            {self._get_conditional_disclaimer_if_necessary(question)}
-            End with: "Probability: ZZ%" (0-100)
-            """
-        )
-        result = await self._binary_prompt_to_forecast(question, prompt, ext_cfg=ext_cfg)
+                ---
+
+                Question: {question.question_text}
+                Background: {question.background_info}
+                Resolution criteria (not yet satisfied): {question.resolution_criteria}
+                {question.fine_print}
+                Research: {research}
+                Today is {datetime.now().strftime("%Y-%m-%d")}.
+
+                Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
+
+                {self._get_conditional_disclaimer_if_necessary(question)}
+                End with: "Probability: ZZ%" (0-100)
+                """
+            )
+            try:
+                reasoning = await self._llm_invoke("default", prompt)
+            except Exception as exc:
+                logger.warning(f"[UpskillBot] LLM failed for {question.page_url}: {exc}. Returning 50% prior.")
+                return ReasonedPrediction(prediction_value=0.5, reasoning="LLM failed; returning uninformative prior.")
+
+            logger.info(f"[UpskillBot] Reasoning for {question.page_url}: {reasoning}")
+            binary_prediction: BinaryPrediction = await structure_output(
+                reasoning, BinaryPrediction,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+            raw_p = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+            extremized_p = extremize_probability(raw_p, ext_cfg)
+            logger.info(
+                f"[UpskillBot] Extremization: raw={raw_p:.3f} → {extremized_p:.3f} "
+                f"(factor={ext_cfg.factor}, tournament={self._active_tournament_id or 'unknown'})"
+            )
+            result = ReasonedPrediction(
+                prediction_value=extremized_p,
+                reasoning=reasoning,
+            )
+
         self._validator.validate(question, profile, strategy, result.prediction_value, research)
         return result
 
-    async def _binary_prompt_to_forecast(
-        self, question: BinaryQuestion, prompt: str,
-        ext_cfg: ExtremizationConfig | None = None,
-    ) -> ReasonedPrediction[float]:
-        if ext_cfg is None:
-            ext_cfg = self._get_ext_cfg()
-        try:
-            reasoning = await self._llm_invoke("default", prompt)
-        except Exception as exc:
-            logger.warning(f"[UpskillBot] LLM failed for {question.page_url}: {exc}. Returning 50% prior.")
-            return ReasonedPrediction(prediction_value=0.5, reasoning="LLM failed; returning uninformative prior.")
-
-        logger.info(f"[UpskillBot] Reasoning for {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning, BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        raw_p = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
-        extremized_p = extremize_probability(raw_p, ext_cfg)
-        logger.info(
-            f"[UpskillBot] Extremization: raw={raw_p:.3f} → {extremized_p:.3f} "
-            f"(factor={ext_cfg.factor}, tournament={self._active_tournament_id or 'unknown'})"
-        )
-        return ReasonedPrediction(
-            prediction_value=extremized_p,
-            reasoning=reasoning,
-        )
-
     # -------------------------------------------------------------------
-    # Committee voting methods (hybrid pre-mortem features)
+    # Committee voting helper (used by unified forecast methods)
     # -------------------------------------------------------------------
 
     async def _single_forecast(
@@ -1342,7 +1363,7 @@ class UpskillBot(ForecastBot):
         research: str,
         use_claude: bool = False
     ) -> tuple[Any, str]:
-        """Generate a single forecast using specified model."""
+        """Generate a single forecast using specified model (GPT or Claude)."""
         if use_claude:
             original_default = self._llms.get("default")
             original_parser = self._llms.get("parser")
@@ -1351,7 +1372,6 @@ class UpskillBot(ForecastBot):
 
         try:
             if isinstance(question, BinaryQuestion):
-                profile, strategy = await self._get_profile_and_strategy(question)
                 prompt = clean_indents(f"""
                 You are a professional forecaster.
 
@@ -1413,103 +1433,6 @@ class UpskillBot(ForecastBot):
 
         return result, reasoning
 
-    async def _run_forecast_on_binary_committee(
-        self, question: BinaryQuestion, research: str
-    ) -> ReasonedPrediction[float]:
-        """Run committee of GPT-5 (×2) + Claude-4 with median aggregation."""
-        forecasts = []
-        reasonings = []
-        for i in range(3):
-            use_claude = (i == 2)
-            try:
-                pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
-                if pred is not None and isinstance(pred, float):
-                    forecasts.append(pred)
-                    reasonings.append(reason)
-            except Exception as e:
-                logger.warning(f"[UpskillBot] Committee member {i} failed: {e}")
-                continue
-
-        if not forecasts:
-            logger.warning(f"[UpskillBot] All committee members failed for {question.page_url}")
-            return ReasonedPrediction(prediction_value=0.5, reasoning="Committee failed; returning 50% prior.")
-
-        median_pred = float(np.median(forecasts))
-        return ReasonedPrediction(prediction_value=median_pred, reasoning=" | ".join(reasonings))
-
-    async def _run_forecast_on_multiple_choice_committee(
-        self, question: MultipleChoiceQuestion, research: str
-    ) -> ReasonedPrediction[PredictedOptionList]:
-        """Run committee with median aggregation for multiple choice."""
-        forecasts = []
-        reasonings = []
-        for i in range(3):
-            use_claude = (i == 2)
-            try:
-                pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
-                if pred is not None and isinstance(pred, PredictedOptionList):
-                    forecasts.append(pred)
-                    reasonings.append(reason)
-            except Exception as e:
-                logger.warning(f"[UpskillBot] Committee member {i} failed: {e}")
-                continue
-
-        if not forecasts:
-            logger.warning(f"[UpskillBot] All committee members failed for {question.page_url}")
-            return ReasonedPrediction(prediction_value=PredictedOptionList([]), reasoning="Committee failed")
-
-        # Median per option
-        all_probs = np.array([[opt["probability"] for opt in f.predicted_options] for f in forecasts])
-        median_probs = np.median(all_probs, axis=0)
-        if median_probs.sum() > 0:
-            median_probs = median_probs / median_probs.sum()
-        else:
-            median_probs = np.full_like(median_probs, 1.0 / len(median_probs))
-        options = forecasts[0].predicted_options
-        median_forecast = PredictedOptionList([
-            {"option": opt["option"], "probability": float(p)} for opt, p in zip(options, median_probs)
-        ])
-        return ReasonedPrediction(prediction_value=median_forecast, reasoning=" | ".join(reasonings))
-
-    async def _run_forecast_on_numeric_committee(
-        self, question: NumericQuestion, research: str
-    ) -> ReasonedPrediction[NumericDistribution]:
-        """Run committee with median aggregation for numeric questions."""
-        forecasts = []
-        reasonings = []
-        for i in range(3):
-            use_claude = (i == 2)
-            try:
-                pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
-                if pred is not None and isinstance(pred, NumericDistribution):
-                    forecasts.append(pred)
-                    reasonings.append(reason)
-            except Exception as e:
-                logger.warning(f"[UpskillBot] Committee member {i} failed: {e}")
-                continue
-
-        if not forecasts:
-            logger.warning(f"[UpskillBot] All committee members failed for {question.page_url}")
-            return ReasonedPrediction(prediction_value=NumericDistribution([]), reasoning="Committee failed")
-
-        # Extract percentiles
-        target_percentiles = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
-        aggregated = []
-        for p in target_percentiles:
-            values = []
-            for f in forecasts:
-                for item in f.declared_percentiles:
-                    if abs(item.percentile - p) < 0.01:
-                        values.append(item.value)
-                        break
-                else:
-                    values.append(0.0)
-            median_val = float(np.median(values)) if values else 0.0
-            aggregated.append(Percentile(percentile=p, value=median_val))
-        # Reconstruct using question bounds
-        distribution = NumericDistribution.from_question(aggregated, question)
-        return ReasonedPrediction(prediction_value=distribution, reasoning=" | ".join(reasonings))
-
     # -------------------------------------------------------------------
     # Multiple choice
     # -------------------------------------------------------------------
@@ -1518,51 +1441,82 @@ class UpskillBot(ForecastBot):
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
         profile, strategy = await self._get_profile_and_strategy(question)
-        prompt = clean_indents(
-            f"""
-            You are UpskillBot, a professional superforecaster aiming for accurate forecasts and high scores on metaculus.
-            {self._client_context_block()}
-            {self._superforecasting_preamble()}
 
-            {self._anti_hedging_instruction()}
+        # Committee mode: 3 votes with median aggregation per option
+        if self._use_committee_voting:
+            forecasts = []
+            reasonings = []
+            for i in range(3):
+                use_claude = (i == 2)
+                try:
+                    pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
+                    if pred is not None and isinstance(pred, PredictedOptionList):
+                        forecasts.append(pred)
+                        reasonings.append(reason)
+                except Exception as e:
+                    logger.warning(f"[UpskillBot] Committee member {i} failed: {e}")
+                    continue
 
-            {ModellingStrategy.get_prompt_block(strategy, profile)}
+            if not forecasts:
+                logger.warning(f"[UpskillBot] All committee members failed for {question.page_url}")
+                return ReasonedPrediction(prediction_value=PredictedOptionList([]), reasoning="Committee failed")
 
-            ---
+            # Median per option
+            all_probs = np.array([[opt["probability"] for opt in f.predicted_options] for f in forecasts])
+            median_probs = np.median(all_probs, axis=0)
+            if median_probs.sum() > 0:
+                median_probs = median_probs / median_probs.sum()
+            else:
+                median_probs = np.full_like(median_probs, 1.0 / len(median_probs))
+            options = forecasts[0].predicted_options
+            median_forecast = PredictedOptionList([
+                {"option": opt["option"], "probability": float(p)} for opt, p in zip(options, median_probs)
+            ])
+            logger.info(f"[UpskillBot] Committee multiple_choice: median_probs={list(median_probs)}")
+            result = ReasonedPrediction(prediction_value=median_forecast, reasoning=" | ".join(reasonings))
+        # Standard mode: single forecast
+        else:
+            prompt = clean_indents(
+                f"""
+                You are UpskillBot, a professional superforecaster aiming for accurate forecasts and high scores on metaculus.
+                {self._client_context_block()}
+                {self._superforecasting_preamble()}
 
-            Question: {question.question_text}
-            Options: {question.options}
-            Background: {question.background_info}
-            Resolution criteria: {question.resolution_criteria}
-            {question.fine_print}
-            Research: {research}
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+                {self._anti_hedging_instruction()}
 
-            Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
+                {ModellingStrategy.get_prompt_block(strategy, profile)}
 
-            {self._get_conditional_disclaimer_if_necessary(question)}
-            Avoid 0% unless logically impossible.
+                ---
 
-            End with probabilities in this exact order {question.options}:
-            Option_A: Probability_A ...
-            """
-        )
-        result = await self._multiple_choice_prompt_to_forecast(question, prompt)
+                Question: {question.question_text}
+                Options: {question.options}
+                Background: {question.background_info}
+                Resolution criteria: {question.resolution_criteria}
+                {question.fine_print}
+                Research: {research}
+                Today is {datetime.now().strftime("%Y-%m-%d")}.
+
+                Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
+
+                {self._get_conditional_disclaimer_if_necessary(question)}
+                Avoid 0% unless logically impossible.
+
+                End with probabilities in this exact order {question.options}:
+                Option_A: Probability_A ...
+                """
+            )
+            reasoning = await self._llm_invoke("default", prompt)
+            logger.info(f"[UpskillBot] Reasoning for {question.page_url}: {reasoning}")
+            predicted_option_list: PredictedOptionList = await structure_output(
+                text_to_structure=reasoning, output_type=PredictedOptionList,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+                additional_instructions=f"Option names must match one of: {question.options}. Do not drop any option.",
+            )
+            result = ReasonedPrediction(prediction_value=predicted_option_list, reasoning=reasoning)
+
         self._validator.validate(question, profile, strategy, result.prediction_value, research)
         return result
-
-    async def _multiple_choice_prompt_to_forecast(
-        self, question: MultipleChoiceQuestion, prompt: str
-    ) -> ReasonedPrediction[PredictedOptionList]:
-        reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"[UpskillBot] Reasoning for {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning, output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-            additional_instructions=f"Option names must match one of: {question.options}. Do not drop any option.",
-        )
-        return ReasonedPrediction(prediction_value=predicted_option_list, reasoning=reasoning)
 
     # -------------------------------------------------------------------
     # Numeric
@@ -1573,58 +1527,93 @@ class UpskillBot(ForecastBot):
     ) -> ReasonedPrediction[NumericDistribution]:
         profile, strategy = await self._get_profile_and_strategy(question)
         upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
-        prompt = clean_indents(
-            f"""
-            You are UpskillBot, a professional superforecaster.
-            {self._client_context_block()}
-            {self._superforecasting_preamble()}
 
-            {ModellingStrategy.get_prompt_block(strategy, profile)}
+        # Committee mode: 3 votes with median aggregation per percentile
+        if self._use_committee_voting:
+            forecasts = []
+            reasonings = []
+            for i in range(3):
+                use_claude = (i == 2)
+                try:
+                    pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
+                    if pred is not None and isinstance(pred, NumericDistribution):
+                        forecasts.append(pred)
+                        reasonings.append(reason)
+                except Exception as e:
+                    logger.warning(f"[UpskillBot] Committee member {i} failed: {e}")
+                    continue
 
-            ---
+            if not forecasts:
+                logger.warning(f"[UpskillBot] All committee members failed for {question.page_url}")
+                return ReasonedPrediction(prediction_value=NumericDistribution([]), reasoning="Committee failed")
 
-            Question: {question.question_text}
-            Background: {question.background_info}
-            {question.resolution_criteria}
-            {question.fine_print}
-            Units: {question.unit_of_measure if question.unit_of_measure else "Not stated (infer)"}
-            Research: {research}
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-            {lower_msg}
-            {upper_msg}
+            # Extract and aggregate percentiles
+            target_percentiles = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+            aggregated = []
+            for p in target_percentiles:
+                values = []
+                for f in forecasts:
+                    for item in f.declared_percentiles:
+                        if abs(item.percentile - p) < 0.01:
+                            values.append(item.value)
+                            break
+                    else:
+                        values.append(0.0)
+                median_val = float(np.median(values)) if values else 0.0
+                aggregated.append(Percentile(percentile=p, value=median_val))
+            distribution = NumericDistribution.from_question(aggregated, question)
+            logger.info(f"[UpskillBot] Committee numeric: aggregated percentiles from {len(forecasts)} votes")
+            result = ReasonedPrediction(prediction_value=distribution, reasoning=" | ".join(reasonings))
+        # Standard mode: single forecast
+        else:
+            prompt = clean_indents(
+                f"""
+                You are UpskillBot, a professional superforecaster.
+                {self._client_context_block()}
+                {self._superforecasting_preamble()}
 
-            Formatting: no scientific notation; percentiles strictly increasing.
+                {ModellingStrategy.get_prompt_block(strategy, profile)}
 
-            Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
+                ---
 
-            {self._get_conditional_disclaimer_if_necessary(question)}
+                Question: {question.question_text}
+                Background: {question.background_info}
+                {question.resolution_criteria}
+                {question.fine_print}
+                Units: {question.unit_of_measure if question.unit_of_measure else "Not stated (infer)"}
+                Research: {research}
+                Today is {datetime.now().strftime("%Y-%m-%d")}.
+                {lower_msg}
+                {upper_msg}
 
-            End with:
-            Percentile 10: XX  Percentile 20: XX  Percentile 40: XX
-            Percentile 60: XX  Percentile 80: XX  Percentile 90: XX
-            """
-        )
-        result = await self._numeric_prompt_to_forecast(question, prompt)
+                Formatting: no scientific notation; percentiles strictly increasing.
+
+                Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
+
+                {self._get_conditional_disclaimer_if_necessary(question)}
+
+                End with:
+                Percentile 10: XX  Percentile 20: XX  Percentile 40: XX
+                Percentile 60: XX  Percentile 80: XX  Percentile 90: XX
+                """
+            )
+            reasoning = await self._llm_invoke("default", prompt)
+            logger.info(f"[UpskillBot] Reasoning for {question.page_url}: {reasoning}")
+            percentile_list: list[Percentile] = await structure_output(
+                reasoning, list[Percentile], model=self.get_llm("parser", "llm"),
+                additional_instructions=(
+                    f'Parse a numeric percentile forecast for: "{question.question_text}"\n'
+                    f"Units: {question.unit_of_measure}. Convert units if needed."
+                ),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+            result = ReasonedPrediction(
+                prediction_value=NumericDistribution.from_question(percentile_list, question),
+                reasoning=reasoning,
+            )
+
         self._validator.validate(question, profile, strategy, result.prediction_value, research)
         return result
-
-    async def _numeric_prompt_to_forecast(
-        self, question: NumericQuestion, prompt: str
-    ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"[UpskillBot] Reasoning for {question.page_url}: {reasoning}")
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning, list[Percentile], model=self.get_llm("parser", "llm"),
-            additional_instructions=(
-                f'Parse a numeric percentile forecast for: "{question.question_text}"\n'
-                f"Units: {question.unit_of_measure}. Convert units if needed."
-            ),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        return ReasonedPrediction(
-            prediction_value=NumericDistribution.from_question(percentile_list, question),
-            reasoning=reasoning,
-        )
 
     # -------------------------------------------------------------------
     # Date
