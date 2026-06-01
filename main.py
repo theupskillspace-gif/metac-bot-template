@@ -46,17 +46,11 @@ try:
 except ImportError:
     TavilyClient = None
 
-try:
-    from newsapi import NewsApiClient
-except ImportError:
-    NewsApiClient = None
-
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Environment & API Keys
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
 # ---------------------------------------------------------------------------
@@ -1064,19 +1058,6 @@ class UpskillBot(ForecastBot):
             return "\n".join([f"- {c['content']}" for c in response.get('results', [])])
         except Exception as e:
             return f"Tavily failed: {e}"
-
-    def call_newsapi(self, query: str) -> str:
-        """Call NewsAPI for recent news."""
-        if not NEWSAPI_API_KEY or not NewsApiClient:
-            return ""
-        try:
-            newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
-            articles = newsapi_client.get_everything(q=query, language='en', sort_by='relevancy', page_size=5)
-            if not articles or not articles.get('articles'):
-                return ""
-            return "\n".join([f"- Title: {a['title']}\n  Snippet: {a.get('description', 'N/A')}" for a in articles['articles']])
-        except Exception as e:
-            return f"NewsAPI failed: {e}"
 
     async def _plan_queries(
         self, question: MetaculusQuestion, profile: QuestionProfile
