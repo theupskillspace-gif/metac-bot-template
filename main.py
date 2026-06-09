@@ -1884,7 +1884,7 @@ if __name__ == "__main__":
     if run_mode == "tournament":
         # Default tournament IDs if not specified
         if args.tournament_ids is None:
-            args.tournament_ids = ["33022", "market-pulse-26q2", client.CURRENT_MINIBENCH_ID]
+            args.tournament_ids = ["market-pulse-26q2", client.CURRENT_MINIBENCH_ID]
 
         all_reports = []
         for tid in args.tournament_ids:
