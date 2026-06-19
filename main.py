@@ -56,11 +56,11 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-_CLAUDE_OPUS_MODEL      = "openrouter/anthropic/claude-opus-4.6"
-_CLAUDE_SONNET_MODEL    = "openrouter/anthropic/claude-sonnet-4.6"
+_CLAUDE_OPUS_MODEL      = "openrouter/openai/gpt-oss-120b:free"
+_CLAUDE_SONNET_MODEL    = "openrouter/openai/o3"
 _GPT_MODEL              = "openrouter/openai/gpt-5.1"
-_CLAUDE_4_MODEL         = "openrouter/anthropic/claude-4"
-_PERPLEXITY_MODEL       = "openrouter/perplexity/sonar-pro"
+_CLAUDE_4_MODEL         = "openrouter/anthropic/claude-sonnet-4.5"
+_PERPLEXITY_MODEL       = "openrouter/nvidia/nemotron-3-nano-30b-a3b:free"
 DOMAINS = [
     "geopolitics", "economics", "technology", "science",
     "public_health", "environment", "sports", "finance", "social", "other",
@@ -1873,7 +1873,7 @@ if __name__ == "__main__":
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
+        skip_previously_forecasted_questions=False,
         extra_metadata_in_explanation=False,
     )
 
