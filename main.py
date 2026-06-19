@@ -57,9 +57,9 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 # Model identifiers
 # ---------------------------------------------------------------------------
 _CLAUDE_OPUS_MODEL      = "openrouter/openai/gpt-oss-120b:free"
-_CLAUDE_SONNET_MODEL    = "openrouter/openai/o3"
-_GPT_MODEL              = "openrouter/openai/gpt-5.1"
-_CLAUDE_4_MODEL         = "openrouter/anthropic/claude-sonnet-4.5"
+_CLAUDE_SONNET_MODEL    = "openrouter/openai/gpt-oss-120b:free"
+_GPT_MODEL              = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+_CLAUDE_4_MODEL         = "openrouter/nvidia/nemotron-3-nano-30b-a3b:free"
 _PERPLEXITY_MODEL       = "openrouter/nvidia/nemotron-3-nano-30b-a3b:free"
 DOMAINS = [
     "geopolitics", "economics", "technology", "science",
