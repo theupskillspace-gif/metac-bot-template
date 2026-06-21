@@ -55,12 +55,27 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
 # ---------------------------------------------------------------------------
 # Model identifiers
+#
+# Committee voting uses two OpenRouter-hosted OpenAI models:
+#   - o3       : primary reasoning model, used for 2 of 3 committee votes
+#   - o4-mini  : secondary model, used for 1 of 3 committee votes
+#
+# NOTE: confirm both slugs are currently listed as available on
+# https://openrouter.ai/models before running — an unrecognized/retired
+# slug is what causes requests to get silently routed to OpenRouter's
+# "Stealth" pool and return malformed 502 "Invalid URL" errors.
+# Also note: neither model is free-tier; o3 in particular is expensive
+# per call, and committee mode triggers 3 LLM calls per question.
 # ---------------------------------------------------------------------------
-_CLAUDE_OPUS_MODEL      = "openrouter/openai/gpt-oss-120b:free"
-_CLAUDE_SONNET_MODEL    = "openrouter/openai/gpt-oss-120b:free"
-_GPT_MODEL              = "openrouter/free"
-_CLAUDE_4_MODEL         = "openrouter/nvidia/nemotron-3-nano-30b-a3b:free"
-_PERPLEXITY_MODEL       = "openrouter/nvidia/nemotron-3-nano-30b-a3b:free"
+_MODEL_PRIMARY          = "openrouter/openai/o3"
+_MODEL_SECONDARY        = "openrouter/openai/o4-mini"
+
+_CLAUDE_OPUS_MODEL      = _MODEL_PRIMARY
+_CLAUDE_SONNET_MODEL    = _MODEL_PRIMARY
+_GPT_MODEL              = _MODEL_PRIMARY
+_CLAUDE_4_MODEL         = _MODEL_SECONDARY   # used for committee vote index 2
+_PERPLEXITY_MODEL       = _MODEL_PRIMARY     # unused now; Perplexity source removed
+
 DOMAINS = [
     "geopolitics", "economics", "technology", "science",
     "public_health", "environment", "sports", "finance", "social", "other",
@@ -206,6 +221,9 @@ class ModellingStrategy:
 
 # ===========================================================================
 # 3. PLUGGABLE SOURCE REGISTRY
+#
+# Active sources: Tavily (web search) + Exa (neural search) only.
+# OpenRouter-search, Perplexity, and AskNews sources have been removed.
 # ===========================================================================
 
 class BaseSource(ABC):
@@ -404,198 +422,6 @@ class ExaSource(BaseSource):
             return "\n".join(lines).strip()
         except Exception as exc:
             return f"Query: {query}\n- Exa failed: {type(exc).__name__}: {exc}"
-
-
-# ---------------------------------------------------------------------------
-# AskNewsSource  (real-time news with AI summaries)
-# ---------------------------------------------------------------------------
-
-class AskNewsSource(BaseSource):
-    """
-    AskNews API (https://asknews.app).
-    Requires ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET in environment.
-    Uses OAuth2 client-credentials to get a bearer token, then queries /v1/news/search.
-    """
-    name = "asknews_news"
-    _TOKEN_URL  = "https://auth.asknews.app/oauth2/token"
-    _SEARCH_URL = "https://api.asknews.app/v1/news/search"
-
-    def __init__(self, client_id: str, client_secret: str,
-                 n_articles: int = 6, timeout_s: int = 30):
-        self._client_id     = client_id
-        self._client_secret = client_secret
-        self._n_articles    = n_articles
-        self._timeout_s     = timeout_s
-        self._token: str    = ""
-        self._token_expiry: float = 0.0
-
-    def is_available(self) -> bool:
-        return bool(self._client_id and self._client_secret)
-
-    def _get_token_sync(self) -> str:
-        """Fetch (or reuse) an OAuth2 bearer token."""
-        if time.time() < self._token_expiry - 60:
-            return self._token
-        payload = (
-            f"grant_type=client_credentials"
-            f"&client_id={self._client_id}"
-            f"&client_secret={self._client_secret}"
-        ).encode("utf-8")
-        req = Request(
-            self._TOKEN_URL, data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
-        with urlopen(req, timeout=self._timeout_s) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        self._token        = data["access_token"]
-        self._token_expiry = time.time() + data.get("expires_in", 3600)
-        return self._token
-
-    def _search_sync(self, query: str) -> dict[str, Any]:
-        token  = self._get_token_sync()
-        params = f"query={query.replace(' ', '+')}&n_articles={self._n_articles}&return_type=both"
-        url    = f"{self._SEARCH_URL}?{params}"
-        req    = Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-        with urlopen(req, timeout=self._timeout_s) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="replace"))
-
-    async def fetch(self, query: str) -> str:
-        if not self.is_available():
-            return ""
-        try:
-            raw = await asyncio.to_thread(self._search_sync, query)
-            articles = raw.get("articles", []) or raw.get("data", {}).get("articles", [])
-            lines = [f"Query: {query}"]
-            for art in articles[: self._n_articles]:
-                title   = (art.get("eng_title") or art.get("title") or "").strip()
-                summary = (art.get("summary")   or "").strip()
-                url     = (art.get("article_url") or art.get("url") or "").strip()
-                pub_at  = (art.get("pub_date")  or "").strip()
-                lines.append(f"- [{pub_at}] {title}")
-                if url:
-                    lines.append(f"  URL: {url}")
-                if summary:
-                    lines.append(f"  Summary: {summary[:1000]}")
-            return "\n".join(lines).strip()
-        except Exception as exc:
-            return f"Query: {query}\n- AskNews failed: {type(exc).__name__}: {exc}"
-
-
-class PerplexitySource(BaseSource):
-    """Perplexity Sonar Pro semantic research."""
-    name = "perplexity_sonar_pro"
-    _API_URL = "https://api.perplexity.ai/chat/completions"
-
-    def __init__(self, api_key: str, timeout_s: int = 30, model: str | None = None):
-        self._api_key   = api_key
-        self._timeout_s = timeout_s
-        self._model     = model or _PERPLEXITY_MODEL
-
-    def is_available(self) -> bool:
-        return bool(self._api_key)
-
-    async def fetch(self, query: str) -> str:
-        if not self._api_key:
-            return ""
-        payload = {
-            "model": self._model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert search assistant for current events and forecasting. "
-                        "Provide concise but evidence-rich summaries of the most relevant news, "
-                        "expert commentary, and market signals for this question."
-                    ),
-                },
-                {"role": "user", "content": query},
-            ],
-            "temperature": 0.0,
-            "max_tokens": 1200,
-        }
-        headers = {
-            "accept": "application/json",
-            "authorization": f"Bearer {self._api_key}",
-            "content-type": "application/json",
-        }
-        try:
-            response = await asyncio.to_thread(
-                requests.post,
-                self._API_URL,
-                json=payload,
-                headers=headers,
-                timeout=self._timeout_s,
-            )
-            if not response.ok:
-                return f"Query: {query}\n- Perplexity failed: {response.status_code} {response.text}"
-            data = response.json()
-            content = (
-                data.get("choices", [{}])[0].get("message", {}).get("content")
-                or data.get("output")
-                or ""
-            )
-            return f"[Perplexity Sonar Pro]\nQuery: {query}\n{content.strip()}"
-        except Exception as exc:
-            return f"Query: {query}\n- Perplexity failed: {type(exc).__name__}: {exc}"
-
-
-class OpenRouterSearchSource(BaseSource):
-    """OpenRouter GPT-5 search-style research."""
-    name = "openrouter_gpt5_search"
-    _API_URL = "https://openrouter.ai/v1/chat/completions"
-
-    def __init__(self, api_key: str, model: str | None = None, timeout_s: int = 30):
-        self._api_key   = api_key
-        self._model     = model or _GPT_MODEL
-        self._timeout_s = timeout_s
-
-    def is_available(self) -> bool:
-        return bool(self._api_key)
-
-    async def fetch(self, query: str) -> str:
-        if not self._api_key:
-            return ""
-        payload = {
-            "model": self._model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a search and summarization assistant. "
-                        "For the query below, return the most relevant up-to-date evidence, "
-                        "key facts, and context that a forecaster would need. "
-                        "Do not produce a forecast."
-                    ),
-                },
-                {"role": "user", "content": query},
-            ],
-            "temperature": 0.0,
-            "max_tokens": 1200,
-        }
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-        try:
-            response = await asyncio.to_thread(
-                requests.post,
-                self._API_URL,
-                json=payload,
-                headers=headers,
-                timeout=self._timeout_s,
-            )
-            if not response.ok:
-                return f"Query: {query}\n- OpenRouter search failed: {response.status_code} {response.text}"
-            data = response.json()
-            content = (
-                data.get("choices", [{}])[0].get("message", {}).get("content")
-                or data.get("output")
-                or ""
-            )
-            return f"[OpenRouter GPT-5 Search]\nQuery: {query}\n{content.strip()}"
-        except Exception as exc:
-            return f"Query: {query}\n- OpenRouter search failed: {type(exc).__name__}: {exc}"
 
 
 # ===========================================================================
@@ -875,8 +701,13 @@ def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
 
 class UpskillBot(ForecastBot):
     """
-    UpskillBot – superforecaster bot with multi-API research (AskNews, Perplexity Sonar Pro, OpenRouter GPT-5, Exa, Tavily),
+    UpskillBot – superforecaster bot with multi-API research (Tavily + Exa),
     per-tournament extremization, and a conservativeness gate before publishing.
+
+    Forecasting LLMs: openrouter/openai/o3 (primary, 2 of 3 committee votes)
+    and openrouter/openai/o4-mini (secondary, 1 of 3 committee votes).
+    All forecast prompts require grounding in the research block over
+    the model's own priors (see _research_grounding_instruction).
     """
 
     _max_concurrent_questions = 3
@@ -891,13 +722,12 @@ class UpskillBot(ForecastBot):
     def __init__(self, *args, client_spec: ClientSpecialisation | None = None, **kwargs):
         llms = kwargs.pop("llms", None)
         if llms is None:
-            sonnet_llm = GeneralLlm(model=_CLAUDE_SONNET_MODEL, temperature=0.10, timeout=90, allowed_tries=3)
-            gpt_llm    = GeneralLlm(model=_GPT_MODEL,           temperature=0.15, timeout=90, allowed_tries=3)
+            primary_llm = GeneralLlm(model=_MODEL_PRIMARY, temperature=0.10, timeout=90, allowed_tries=3)
             llms = {
-                "default":    gpt_llm,
-                "summarizer": gpt_llm,
-                "researcher": gpt_llm,
-                "parser":     gpt_llm,
+                "default":    primary_llm,
+                "summarizer": primary_llm,
+                "researcher": primary_llm,
+                "parser":     primary_llm,
             }
         super().__init__(*args, llms=llms, **kwargs)
 
@@ -912,24 +742,8 @@ class UpskillBot(ForecastBot):
         # Active tournament tracking for per-tournament extremization
         self._active_tournament_id: str = "minibench"
 
-        # Source registry: AskNews + Perplexity + OpenRouter + Tavily + Exa
+        # Source registry: Tavily + Exa only
         self._sources = SourceRegistry()
-
-        openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-        self._sources.register(OpenRouterSearchSource(api_key=openrouter_key))
-
-        perplexity_key = os.getenv("PERPLEXITY_API_KEY", "").strip()
-        self._sources.register(PerplexitySource(api_key=perplexity_key))
-
-        asknews_id     = os.getenv("ASKNEWS_CLIENT_ID",     "").strip()
-        asknews_secret = (
-            os.getenv("ASKNEWS_CLIENT_SECRET", "").strip()
-            or os.getenv("ASKNEWS_SECRET", "").strip()
-        )
-        self._sources.register(AskNewsSource(
-            client_id=asknews_id,
-            client_secret=asknews_secret,
-        ))
 
         tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
         self._sources.register(TavilySource(
@@ -1041,6 +855,35 @@ class UpskillBot(ForecastBot):
             Answers like 48%–52% are only appropriate when evidence is genuinely
             balanced on both sides. Express your actual conviction based on the
             evidence — a well-reasoned 75% is better than a timid 53%.
+            """
+        ).strip()
+
+    # -------------------------------------------------------------------
+    # Research grounding instruction (injected into ALL forecast prompts)
+    # -------------------------------------------------------------------
+
+    @staticmethod
+    def _research_grounding_instruction() -> str:
+        return clean_indents(
+            """
+            ## Research grounding requirement
+            Your forecast must be driven primarily by the RESEARCH block below,
+            not by your own prior beliefs about the topic. Concretely:
+            1. Before reasoning, list the 2-4 most decision-relevant facts found
+               in the research (status quo state, recent developments, any
+               market/forecaster signal, relevant base rate data).
+            2. If the research contains a clear quantitative signal (e.g. a
+               prediction market price, a community prediction, a poll, a
+               survey), treat it as your primary anchor and only deviate from
+               it if you can name a specific piece of research evidence that
+               the signal hasn't priced in.
+            3. If the research is thin or stale relative to the question's
+               time horizon, say so explicitly and fall back to the base-rate
+               strategy below rather than guessing.
+            4. Do not introduce outside facts that are not present in the
+               research and are not common, stable knowledge (e.g. "Canada is
+               in North America" is fine; "Company X just announced Y" is not,
+               unless it's in the research).
             """
         ).strip()
 
@@ -1197,7 +1040,7 @@ class UpskillBot(ForecastBot):
             source_bundle = await self._multi_source_research_bundle(question, profile)
             metaculus_block = self._format_metaculus_research(question)
             research_raw  = (
-                f"{base}\n\n--- MULTI-SOURCE RESEARCH (Metaculus / AskNews / Perplexity / OpenRouter GPT-5 / Exa / Tavily) ---\n{metaculus_block}\n\n{source_bundle}"
+                f"{base}\n\n--- MULTI-SOURCE RESEARCH (Metaculus / Tavily / Exa) ---\n{metaculus_block}\n\n{source_bundle}"
                 if source_bundle else f"{base}\n\n--- Metaculus research ---\n{metaculus_block}"
             )
 
@@ -1261,9 +1104,9 @@ class UpskillBot(ForecastBot):
             forecasts = []
             reasonings = []
             for i in range(3):
-                use_claude = (i == 2)
+                use_secondary = (i == 2)
                 try:
-                    pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
+                    pred, reason = await self._single_forecast(question, research, use_claude=use_secondary)
                     if pred is not None and isinstance(pred, float):
                         forecasts.append(pred)
                         reasonings.append(reason)
@@ -1290,6 +1133,8 @@ class UpskillBot(ForecastBot):
                 {self._superforecasting_preamble()}
 
                 {self._anti_hedging_instruction()}
+
+                {self._research_grounding_instruction()}
 
                 {ModellingStrategy.get_prompt_block(strategy, profile)}
 
@@ -1344,17 +1189,21 @@ class UpskillBot(ForecastBot):
         research: str,
         use_claude: bool = False
     ) -> tuple[Any, str]:
-        """Generate a single forecast using specified model (GPT or Claude)."""
+        """Generate a single forecast. use_claude=True routes this vote
+        through the secondary model (_MODEL_SECONDARY / o4-mini) instead
+        of the primary model (_MODEL_PRIMARY / o3)."""
         if use_claude:
             original_default = self._llms.get("default")
             original_parser = self._llms.get("parser")
-            self._llms["default"] = GeneralLlm(model=_CLAUDE_4_MODEL, temperature=0.1, timeout=90, allowed_tries=3)
-            self._llms["parser"] = GeneralLlm(model=_CLAUDE_4_MODEL, temperature=0.1, timeout=90, allowed_tries=3)
+            self._llms["default"] = GeneralLlm(model=_MODEL_SECONDARY, temperature=0.1, timeout=90, allowed_tries=3)
+            self._llms["parser"] = GeneralLlm(model=_MODEL_SECONDARY, temperature=0.1, timeout=90, allowed_tries=3)
 
         try:
             if isinstance(question, BinaryQuestion):
                 prompt = clean_indents(f"""
                 You are a professional forecaster.
+
+                {self._research_grounding_instruction()}
 
                 Question: {question.question_text}
                 Background: {question.background_info}
@@ -1371,6 +1220,8 @@ class UpskillBot(ForecastBot):
 
             elif isinstance(question, MultipleChoiceQuestion):
                 prompt = clean_indents(f"""
+                {self._research_grounding_instruction()}
+
                 Question: {question.question_text}
                 Options: {question.options}
                 Background: {question.background_info}
@@ -1390,6 +1241,8 @@ class UpskillBot(ForecastBot):
                 lower_msg = f"Lower bound: {'open' if question.open_lower_bound else 'closed'} at {question.lower_bound or question.nominal_lower_bound}"
                 upper_msg = f"Upper bound: {'open' if question.open_upper_bound else 'closed'} at {question.upper_bound or question.nominal_upper_bound}"
                 prompt = clean_indents(f"""
+                {self._research_grounding_instruction()}
+
                 Question: {question.question_text}
                 Units: {question.unit_of_measure or 'Infer from context'}
                 Background: {question.background_info}
@@ -1408,9 +1261,9 @@ class UpskillBot(ForecastBot):
                 result = None
         finally:
             if use_claude:
-                # Restore GPT models
-                self._llms["default"] = original_default or GeneralLlm(model=_GPT_MODEL, temperature=0.15, timeout=90, allowed_tries=3)
-                self._llms["parser"] = original_parser or GeneralLlm(model=_GPT_MODEL, temperature=0.15, timeout=90, allowed_tries=3)
+                # Restore primary model
+                self._llms["default"] = original_default or GeneralLlm(model=_MODEL_PRIMARY, temperature=0.10, timeout=90, allowed_tries=3)
+                self._llms["parser"] = original_parser or GeneralLlm(model=_MODEL_PRIMARY, temperature=0.10, timeout=90, allowed_tries=3)
 
         return result, reasoning
 
@@ -1428,9 +1281,9 @@ class UpskillBot(ForecastBot):
             forecasts = []
             reasonings = []
             for i in range(3):
-                use_claude = (i == 2)
+                use_secondary = (i == 2)
                 try:
-                    pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
+                    pred, reason = await self._single_forecast(question, research, use_claude=use_secondary)
                     if pred is not None and isinstance(pred, PredictedOptionList):
                         forecasts.append(pred)
                         reasonings.append(reason)
@@ -1464,6 +1317,8 @@ class UpskillBot(ForecastBot):
                 {self._superforecasting_preamble()}
 
                 {self._anti_hedging_instruction()}
+
+                {self._research_grounding_instruction()}
 
                 {ModellingStrategy.get_prompt_block(strategy, profile)}
 
@@ -1514,9 +1369,9 @@ class UpskillBot(ForecastBot):
             forecasts = []
             reasonings = []
             for i in range(3):
-                use_claude = (i == 2)
+                use_secondary = (i == 2)
                 try:
-                    pred, reason = await self._single_forecast(question, research, use_claude=use_claude)
+                    pred, reason = await self._single_forecast(question, research, use_claude=use_secondary)
                     if pred is not None and isinstance(pred, NumericDistribution):
                         forecasts.append(pred)
                         reasonings.append(reason)
@@ -1552,6 +1407,8 @@ class UpskillBot(ForecastBot):
                 You are UpskillBot, a professional superforecaster.
                 {self._client_context_block()}
                 {self._superforecasting_preamble()}
+
+                {self._research_grounding_instruction()}
 
                 {ModellingStrategy.get_prompt_block(strategy, profile)}
 
@@ -1610,6 +1467,8 @@ class UpskillBot(ForecastBot):
             You are UpskillBot, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
+
+            {self._research_grounding_instruction()}
 
             {ModellingStrategy.get_prompt_block(strategy, profile)}
 
@@ -1853,7 +1712,7 @@ if __name__ == "__main__":
         "--use-committee",
         action="store_true",
         default=False,
-        help="Use committee voting (GPT-5 x2 + Claude-4) with median aggregation"
+        help="Use committee voting (o3 x2 + o4-mini) with median aggregation"
     )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
