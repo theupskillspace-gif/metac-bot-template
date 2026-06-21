@@ -56,9 +56,10 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 # ---------------------------------------------------------------------------
 # Model identifiers
 #
-# Committee voting uses two OpenRouter-hosted OpenAI models:
-#   - o3       : primary reasoning model, used for 2 of 3 committee votes
-#   - o4-mini  : secondary model, used for 1 of 3 committee votes
+# Roles:
+#   - default / summarizer / researcher / parser  → ALWAYS o3
+#   - committee voting (binary/MC/numeric only)    → o3 for votes 0 & 1,
+#                                                     o4-mini for vote 2
 #
 # NOTE: confirm both slugs are currently listed as available on
 # https://openrouter.ai/models before running — an unrecognized/retired
@@ -66,9 +67,18 @@ SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 # "Stealth" pool and return malformed 502 "Invalid URL" errors.
 # Also note: neither model is free-tier; o3 in particular is expensive
 # per call, and committee mode triggers 3 LLM calls per question.
+#
+# The OPENROUTER_WEB_SEARCH_MODEL below is used only by
+# OpenRouterWebSearchSource (research, not forecasting) and appends
+# OpenRouter's web-grounding plugin suffix to o3. NOTE: ":online" is the
+# documented OpenRouter suffix as of this writing — confirm it is still
+# current (vs. e.g. a "web_search" plugin param) in OpenRouter's docs
+# before running, since this is exactly the kind of thing that silently
+# breaks if the syntax has changed.
 # ---------------------------------------------------------------------------
 _MODEL_PRIMARY          = "openrouter/openai/o3"
 _MODEL_SECONDARY        = "openrouter/openai/o4-mini"
+_OPENROUTER_WEB_SEARCH_MODEL = "openrouter/openai/o3:online"
 
 _CLAUDE_OPUS_MODEL      = _MODEL_PRIMARY
 _CLAUDE_SONNET_MODEL    = _MODEL_PRIMARY
@@ -424,6 +434,88 @@ class ExaSource(BaseSource):
             return f"Query: {query}\n- Exa failed: {type(exc).__name__}: {exc}"
 
 
+# ---------------------------------------------------------------------------
+# OpenRouterWebSearchSource  (OpenRouter's built-in web-grounding plugin)
+# ---------------------------------------------------------------------------
+
+class OpenRouterWebSearchSource(BaseSource):
+    """
+    Uses OpenRouter's web-search-grounded model variant (model slug suffixed
+    with ":online") to run a research query with live web grounding,
+    routed through OpenRouter's own chat completions endpoint.
+
+    Requires OPENROUTER_API_KEY in environment.
+
+    NOTE: the ":online" suffix is the documented mechanism for OpenRouter
+    web grounding as of this writing. If OpenRouter has since introduced a
+    distinct "web_search" plugin parameter or changed the suffix syntax,
+    update _OPENROUTER_WEB_SEARCH_MODEL / the payload below accordingly —
+    an invalid/retired model string is what produces the silent 502
+    "Invalid URL" / Stealth-routing failures seen previously.
+
+    Runs in parallel with Tavily and Exa via SourceRegistry.fetch_all,
+    which already wraps every source call in asyncio.gather(...,
+    return_exceptions=True) — so a failure here never blocks or fails
+    the other sources; it just contributes a "Query failed" text block.
+    """
+    name = "openrouter_web_search"
+    _API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+    def __init__(self, api_key: str, model: str | None = None, timeout_s: int = 30):
+        self._api_key   = api_key
+        self._model     = model or _OPENROUTER_WEB_SEARCH_MODEL
+        self._timeout_s = timeout_s
+
+    def is_available(self) -> bool:
+        return bool(self._api_key)
+
+    async def fetch(self, query: str) -> str:
+        if not self._api_key:
+            return ""
+        payload = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a research assistant with live web access. "
+                        "For the query below, return the most relevant up-to-date "
+                        "facts, figures, dates, and sources a forecaster would need. "
+                        "Cite source names/URLs inline where possible. Do not produce "
+                        "a forecast or probability yourself."
+                    ),
+                },
+                {"role": "user", "content": query},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 1200,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            response = await asyncio.to_thread(
+                requests.post,
+                self._API_URL,
+                json=payload,
+                headers=headers,
+                timeout=self._timeout_s,
+            )
+            if not response.ok:
+                return f"Query: {query}\n- OpenRouter web search failed: {response.status_code} {response.text[:300]}"
+            data = response.json()
+            content = (
+                data.get("choices", [{}])[0].get("message", {}).get("content")
+                or ""
+            )
+            if not content.strip():
+                return f"Query: {query}\n- OpenRouter web search returned empty content"
+            return f"[OpenRouter Web Search ({self._model})]\nQuery: {query}\n{content.strip()}"
+        except Exception as exc:
+            return f"Query: {query}\n- OpenRouter web search failed: {type(exc).__name__}: {exc}"
+
+
 # ===========================================================================
 # 4. FORECAST VALIDATOR
 # ===========================================================================
@@ -722,12 +814,14 @@ class UpskillBot(ForecastBot):
     def __init__(self, *args, client_spec: ClientSpecialisation | None = None, **kwargs):
         llms = kwargs.pop("llms", None)
         if llms is None:
-            primary_llm = GeneralLlm(model=_MODEL_PRIMARY, temperature=0.10, timeout=90, allowed_tries=3)
+            # All non-committee infra roles run on o3. (o4-mini is only used
+            # for the 3rd committee vote in _single_forecast, via use_claude=True.)
+            o3_llm = GeneralLlm(model=_MODEL_PRIMARY, temperature=0.10, timeout=90, allowed_tries=3)
             llms = {
-                "default":    primary_llm,
-                "summarizer": primary_llm,
-                "researcher": primary_llm,
-                "parser":     primary_llm,
+                "default":    o3_llm,
+                "summarizer": o3_llm,
+                "researcher": o3_llm,
+                "parser":     o3_llm,
             }
         super().__init__(*args, llms=llms, **kwargs)
 
@@ -742,7 +836,10 @@ class UpskillBot(ForecastBot):
         # Active tournament tracking for per-tournament extremization
         self._active_tournament_id: str = "minibench"
 
-        # Source registry: Tavily + Exa only
+        # Source registry: Tavily + Exa + OpenRouter web search (all run in
+        # parallel; SourceRegistry.fetch_all already isolates failures per
+        # source via return_exceptions=True, so one failing never blocks
+        # or fails the others).
         self._sources = SourceRegistry()
 
         tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
@@ -754,6 +851,9 @@ class UpskillBot(ForecastBot):
 
         exa_key = os.getenv("EXA_API_KEY", "").strip()
         self._sources.register(ExaSource(api_key=exa_key))
+
+        openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        self._sources.register(OpenRouterWebSearchSource(api_key=openrouter_key))
 
         # Default extremization config (used when no tournament context is set)
         self._ext_cfg = ExtremizationConfig(
@@ -863,15 +963,16 @@ class UpskillBot(ForecastBot):
     # -------------------------------------------------------------------
 
     @staticmethod
-    def _research_grounding_instruction() -> str:
+    def _research_grounding_instruction(today_str: str) -> str:
         return clean_indents(
-            """
+            f"""
             ## Research grounding requirement
             Your forecast must be driven primarily by the RESEARCH block below,
             not by your own prior beliefs about the topic. Concretely:
             1. Before reasoning, list the 2-4 most decision-relevant facts found
                in the research (status quo state, recent developments, any
-               market/forecaster signal, relevant base rate data).
+               market/forecaster signal, relevant base rate data), and note the
+               date of each fact where the research provides one.
             2. If the research contains a clear quantitative signal (e.g. a
                prediction market price, a community prediction, a poll, a
                survey), treat it as your primary anchor and only deviate from
@@ -884,6 +985,28 @@ class UpskillBot(ForecastBot):
                research and are not common, stable knowledge (e.g. "Canada is
                in North America" is fine; "Company X just announced Y" is not,
                unless it's in the research).
+
+            ## Temporal anchoring requirement — read carefully
+            Today's actual date is {today_str}. Your own training data has a
+            knowledge cutoff that is almost certainly earlier than this date —
+            do not assume the world is in the state your training data implies.
+            Concretely:
+            1. Treat every dated fact in the RESEARCH block as more current and
+               more authoritative than anything you "remember" from training,
+               by default. If research and your prior knowledge conflict on a
+               factual matter (who holds a role, what a metric currently is,
+               whether something has already happened), the research wins —
+               state this explicitly in your reasoning ("my training data
+               suggested X, but research from {today_str} shows Y, so I am
+               using Y").
+            2. Do not silently default to a pre-cutoff baseline. If the
+               research doesn't cover a specific detail you'd normally know,
+               say "research did not confirm this" rather than filling the
+               gap from training-era memory.
+            3. When estimating "time until resolution," "time since an event,"
+               or any duration, compute it relative to {today_str}, not
+               relative to any earlier date your training might suggest as
+               "the present."
             """
         ).strip()
 
@@ -906,9 +1029,19 @@ class UpskillBot(ForecastBot):
         self, question: MetaculusQuestion, profile: QuestionProfile
     ) -> list[str]:
         geo_hint = f" (geography: {profile.geography})" if profile.geography else ""
+        today_str = datetime.now().strftime("%Y-%m-%d")
         prompt = clean_indents(
             f"""
             Build a research plan for a {profile.domain} forecasting question{geo_hint}.
+
+            Today's actual date is {today_str}. This is later than your training
+            cutoff — do not phrase queries as if your training-era "present" is
+            still current. Include at least 1-2 queries that explicitly target
+            the most recent available information (e.g. include the current
+            year, words like "latest" or "current", or a recent date range) so
+            that search results reflect the actual state of the world as of
+            {today_str}, not the state of the world when your training data
+            ended.
 
             Return 4 to 6 web-search queries covering: base rates, key drivers,
             recent developments, timelines, expert opinion, prediction market signals.
@@ -1040,14 +1173,22 @@ class UpskillBot(ForecastBot):
             source_bundle = await self._multi_source_research_bundle(question, profile)
             metaculus_block = self._format_metaculus_research(question)
             research_raw  = (
-                f"{base}\n\n--- MULTI-SOURCE RESEARCH (Metaculus / Tavily / Exa) ---\n{metaculus_block}\n\n{source_bundle}"
+                f"{base}\n\n--- MULTI-SOURCE RESEARCH (Metaculus / Tavily / Exa / OpenRouter web search) ---\n{metaculus_block}\n\n{source_bundle}"
                 if source_bundle else f"{base}\n\n--- Metaculus research ---\n{metaculus_block}"
             )
 
+            today_str = datetime.now().strftime("%Y-%m-%d")
             summarize_prompt = clean_indents(
                 f"""
                 You are an assistant to a superforecaster working on a {profile.domain} question
                 (geography: {profile.geography or 'global'}).
+                Today's actual date is {today_str}. Your own training data has an
+                earlier knowledge cutoff than this date, so do not "correct" or
+                discount research findings just because they conflict with what
+                you'd otherwise expect — research dated at or near {today_str} is
+                the current ground truth, not your training-era priors. Where the
+                research includes explicit dates, preserve them in your summary
+                so the forecaster can see how recent each fact is.
                 Summarise the most relevant evidence. Be concise but information-dense.
                 Cover: status quo, key drivers, base rates, timelines, market probabilities.
 
@@ -1126,6 +1267,7 @@ class UpskillBot(ForecastBot):
             result = ReasonedPrediction(prediction_value=extremized_p, reasoning=" | ".join(reasonings))
         # Standard mode: single forecast
         else:
+            today_str = datetime.now().strftime("%Y-%m-%d")
             prompt = clean_indents(
                 f"""
                 You are UpskillBot, a professional superforecaster.
@@ -1134,7 +1276,7 @@ class UpskillBot(ForecastBot):
 
                 {self._anti_hedging_instruction()}
 
-                {self._research_grounding_instruction()}
+                {self._research_grounding_instruction(today_str)}
 
                 {ModellingStrategy.get_prompt_block(strategy, profile)}
 
@@ -1145,7 +1287,7 @@ class UpskillBot(ForecastBot):
                 Resolution criteria (not yet satisfied): {question.resolution_criteria}
                 {question.fine_print}
                 Research: {research}
-                Today is {datetime.now().strftime("%Y-%m-%d")}.
+                Today is {today_str}.
 
                 Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
 
@@ -1198,19 +1340,21 @@ class UpskillBot(ForecastBot):
             self._llms["default"] = GeneralLlm(model=_MODEL_SECONDARY, temperature=0.1, timeout=90, allowed_tries=3)
             self._llms["parser"] = GeneralLlm(model=_MODEL_SECONDARY, temperature=0.1, timeout=90, allowed_tries=3)
 
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
         try:
             if isinstance(question, BinaryQuestion):
                 prompt = clean_indents(f"""
                 You are a professional forecaster.
 
-                {self._research_grounding_instruction()}
+                {self._research_grounding_instruction(today_str)}
 
                 Question: {question.question_text}
                 Background: {question.background_info}
                 Resolution: {question.resolution_criteria}
                 Fine print: {question.fine_print}
                 Research: {research}
-                Today: {datetime.now().strftime("%Y-%m-%d")}
+                Today: {today_str}
 
                 Write analysis, then end with: "Probability: ZZ%"
                 """)
@@ -1220,14 +1364,14 @@ class UpskillBot(ForecastBot):
 
             elif isinstance(question, MultipleChoiceQuestion):
                 prompt = clean_indents(f"""
-                {self._research_grounding_instruction()}
+                {self._research_grounding_instruction(today_str)}
 
                 Question: {question.question_text}
                 Options: {question.options}
                 Background: {question.background_info}
                 Resolution: {question.resolution_criteria}
                 Research: {research}
-                Today: {datetime.now().strftime("%Y-%m-%d")}
+                Today: {today_str}
 
                 Write analysis, then list probabilities for each option in order.
                 """)
@@ -1241,7 +1385,7 @@ class UpskillBot(ForecastBot):
                 lower_msg = f"Lower bound: {'open' if question.open_lower_bound else 'closed'} at {question.lower_bound or question.nominal_lower_bound}"
                 upper_msg = f"Upper bound: {'open' if question.open_upper_bound else 'closed'} at {question.upper_bound or question.nominal_upper_bound}"
                 prompt = clean_indents(f"""
-                {self._research_grounding_instruction()}
+                {self._research_grounding_instruction(today_str)}
 
                 Question: {question.question_text}
                 Units: {question.unit_of_measure or 'Infer from context'}
@@ -1250,7 +1394,7 @@ class UpskillBot(ForecastBot):
                 {lower_msg}
                 {upper_msg}
                 Research: {research}
-                Today: {datetime.now().strftime("%Y-%m-%d")}
+                Today: {today_str}
 
                 Write analysis, then provide percentiles: 10, 20, 40, 60, 80, 90.
                 """)
@@ -1310,6 +1454,7 @@ class UpskillBot(ForecastBot):
             result = ReasonedPrediction(prediction_value=median_forecast, reasoning=" | ".join(reasonings))
         # Standard mode: single forecast
         else:
+            today_str = datetime.now().strftime("%Y-%m-%d")
             prompt = clean_indents(
                 f"""
                 You are UpskillBot, a professional superforecaster aiming for accurate forecasts and high scores on metaculus.
@@ -1318,7 +1463,7 @@ class UpskillBot(ForecastBot):
 
                 {self._anti_hedging_instruction()}
 
-                {self._research_grounding_instruction()}
+                {self._research_grounding_instruction(today_str)}
 
                 {ModellingStrategy.get_prompt_block(strategy, profile)}
 
@@ -1330,7 +1475,7 @@ class UpskillBot(ForecastBot):
                 Resolution criteria: {question.resolution_criteria}
                 {question.fine_print}
                 Research: {research}
-                Today is {datetime.now().strftime("%Y-%m-%d")}.
+                Today is {today_str}.
 
                 Write exactly 3 paragraphs in first person as UpskillBot, summarizing the key logic that informed this forecast. Do not mention any models, search sources, or research methods.
 
@@ -1402,13 +1547,14 @@ class UpskillBot(ForecastBot):
             result = ReasonedPrediction(prediction_value=distribution, reasoning=" | ".join(reasonings))
         # Standard mode: single forecast
         else:
+            today_str = datetime.now().strftime("%Y-%m-%d")
             prompt = clean_indents(
                 f"""
                 You are UpskillBot, a professional superforecaster.
                 {self._client_context_block()}
                 {self._superforecasting_preamble()}
 
-                {self._research_grounding_instruction()}
+                {self._research_grounding_instruction(today_str)}
 
                 {ModellingStrategy.get_prompt_block(strategy, profile)}
 
@@ -1420,7 +1566,7 @@ class UpskillBot(ForecastBot):
                 {question.fine_print}
                 Units: {question.unit_of_measure if question.unit_of_measure else "Not stated (infer)"}
                 Research: {research}
-                Today is {datetime.now().strftime("%Y-%m-%d")}.
+                Today is {today_str}.
                 {lower_msg}
                 {upper_msg}
 
@@ -1462,13 +1608,14 @@ class UpskillBot(ForecastBot):
     ) -> ReasonedPrediction[NumericDistribution]:
         profile, strategy = await self._get_profile_and_strategy(question)
         upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
+        today_str = datetime.now().strftime("%Y-%m-%d")
         prompt = clean_indents(
             f"""
             You are UpskillBot, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
 
-            {self._research_grounding_instruction()}
+            {self._research_grounding_instruction(today_str)}
 
             {ModellingStrategy.get_prompt_block(strategy, profile)}
 
@@ -1479,7 +1626,7 @@ class UpskillBot(ForecastBot):
             {question.resolution_criteria}
             {question.fine_print}
             Research: {research}
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Today is {today_str}.
             {lower_msg}
             {upper_msg}
 
